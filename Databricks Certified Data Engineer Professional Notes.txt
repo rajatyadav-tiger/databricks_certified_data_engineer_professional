@@ -1,0 +1,5480 @@
+
+===============================================DataBricks Delta Lake Engineer Professional===============================================
+
+-------------------------------------------Section 2: Modeling Data Management Solution-------------------------------------------
+
+6. Bronze Ingestion Patterns ------------------------------------------------------------------
+
+Learning Objectives---------
+> Ingestion Models
+> Promoting to Silver
+
+
+Ingestion Patterns------------------
+> Singleplex : One-to-One Mapping
+> Multiplex : One-to-Many Mapping
+
+When setting up ingestion into the bronze layer, we need to decide how input datasets should be mapped to the bronze tables.
+
+i.Singleplex------
+The singleplex is the traditional ingestion model where each data source or topic is ingested separately into a bronze table.
+
+Here is an example of a bookstore dataset.
+
+Each data source is ingested into a separate bronze table, so we end up here having three bronze tables, customers, books and orders.
+These patterns usually works well for batch processing.
+
+Note:- However, for streaming processing of large datasets, if you have many streaming jobs, one per topic,
+you will hit the maximum limit of concurrent jobs in your workspace.
+
+ii.Multiplex------
+Instead, we can use multiplex ingestion model.
+
+This combines many topics, and stream them into a single bronze table.
+In this model, we typically use a pub/sub system such as Kafka as a source, but we can also use files and cloud object storage with Auto Loader.
+
+Coming back to our bookstore example, here we can see that all our input data has been ingested into a single bronze table.
+In this table, records are organized into topics along with the value columns that contains the actual data in JSON format.
+
+Later in the pipeline, the multiplex bronze table will be filtered based on the topic column to create the silver layer tables.
+
+8. Multiplex Bronze (Hands On)------------------------------------------------------------------
+
+9. Configuring Auto Loader for Reliable Ingestion------------------------------------------------------------------
+Configuring Auto Loader for Reliable Ingestion
+When using Auto Loader, you can configure several options for your stream to ensure reliable data ingestion:
+
+
+
+Setting Maximum Bytes per Trigger
+
+If you're ingesting large files that cause long micro-batch processing times or memory issues, you can use the cloudFiles.maxBytesPerTrigger option to control the maximum amount of data processed in each micro-batch. This improves stability and keeps batch durations more predictable. For example, to limit each micro-batch to 1 GB of data, you can configure your stream as follows:
+
+spark.readStream
+     .format("cloudFiles")
+     .option("cloudFiles.format", <source_format>)
+     .option("cloudFiles.maxBytesPerTrigger", "1g")
+     .load("/path/to/files")
+
+
+Handling Bad Records
+
+When working with JSON or CSV files, you can use the badRecordsPath option to capture and isolate invalid records in a separate location for further review. Records with malformed syntax (e.g., missing brackets, extra commas) or schema mismatches (e.g., data type errors, missing fields) are redirected to the specified path.
+
+spark.readStream
+     .format("cloudFiles")
+     .option("cloudFiles.format", "json")
+     .option("badRecordsPath", "/path/to/quarantine")
+     .schema("id int, value double")
+     .load("/path/to/files")
+
+
+Files Filters:
+
+To filter input files based on a specific pattern, such as *.png, you can use the pathGlobFilter option. For example:
+
+spark.readStream
+     .format("cloudFiles")
+     .option("cloudFiles.format", "binaryFile")
+     .option("pathGlobfilter", "*.png")
+     .load("/path/to/files")
+
+
+Schema Evolution:
+
+Auto Loader detects the addition of new columns in input files during processing. To control how this schema change is handled, you can set cloudFiles.schemaEvolutionMode option:
+
+spark.readStream
+     .format("cloudFiles")
+     .option("cloudFiles.format", <source_format>)
+     .option("cloudFiles.schemaEvolutionMode", <mode>)
+     .load("/path/to/files")
+
+
+The supported schema evolution modes include:
+
+
+The default mode is addNewColumns, so when Auto Loader detects a new column, the stream stops with an UnknownFieldException. Before your stream throws this error, Auto Loader updates the schema location with the latest schema by merging new columns to the end of the schema. The next run of the stream executes successfully with the updated schema.
+
+Note that the addNewColumns mode is the default when a schema is not provided, but none is the default when you provide a schema. addNewColumns is not allowed when the schema of the stream is provided.
+
+
+11. Quality Enforcements (Hands On)-------------------------------------------------------------
+
+How to add check constraints to delta tables to ensure the quality of our data.
+
+Table constraints apply boolean filters to columns, and prevent data violating these constraints from being written.
+
+We can define constraints on existing delta tables using -
+:: ALTER TABLE <table_name> ADD CONSTRAINT <CONSTRAINT_NAME> CHECK (some condition).
+
+We can define constraints on existing delta tables using ALTER TABLE _ ADD CONSTRAINT command.
+Here we specify a human readable name for the constraint.
+In our case, timestamp_within_range. Following by a boolean condition to be checked.
+Also notice that the condition of a check constraint looks like a standard WHERE clause you might use
+in a SELECT statement.
+
+::ALTER TABLE orders_silver ADD CONSTRAINT timestamp_within_range CHECK (order_timestamp >  '2025-08-01')
+
+Note:- Table constraints are listed under the properties of the extended table description.
+DESCRIBE EXTENDED orders_silver
+
+INSERT INTO orders_silver
+VALUES ('1', '2022-02-01 00:00:00.000', 'C00001', 0, 0, NULL),
+       ('2', '2019-05-01 00:00:00.000', 'C00001', 0, 0, NULL),
+       ('3', '2023-01-01 00:00:00.000', 'C00001', 0, 0, NULL)
+
+
+The second record has a timestamp of 2019, which violates our check constraint condition.
+As you can see, the write operation failed because of the constraint violation.
+
+Note:- that ACID guarantees on Delta Lake ensure that all transactions are atomic.
+That is, they will either succeed or fail completely.
+So here, none of these records have been inserted, even the ones that don't violate our constraints.
+
+Let us add another constraint.
+ALTER TABLE orders_silver ADD CONSTRAINT valid_quantity CHECK (quantity > 0);
+
+The command failed with this error that says some rows in the table violate the new CHECK constraint.
+In fact, ADD CONSTRAINT command verifies that all existing rows satisfy the constraint before adding it to the table.
+
+Note:- Data violating constraint will fail the job and throw and error.
+If our goal is to exclude bad records but keep streaming jobs running, we will need a different solution. 
+
+Solution :- We could separate such bad records into a quarantine table, for example.
+Or, simply filter them out before writing the data into the table.
+
+from pyspark.sql import functions as F
+
+json_schema = "order_id STRING, order_timestamp Timestamp, customer_id STRING, quantity BIGINT, total BIGINT, books ARRAY<STRUCT<book_id STRING, quantity BIGINT, subtotal BIGINT>>"
+
+query = (spark.readStream.table("bronze")
+        .filter("topic = 'orders'")
+        .select(F.from_json(F.col("value").cast("string"), json_schema).alias("v"))
+        .select("v.*")
+        .filter("quantity > 0")
+     .writeStream
+        .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/orders_silver")
+        .trigger(availableNow=True)
+        .table("orders_silver"))
+		
+DROP CONSTRAINT
+If we need to remove a constraint from a table, we use a DROP CONSTRAINT command.
+ALTER TABLE orders_silver DROP CONSTRAINT timestamp_within_range;
+
+12.  Streaming Deduplication (Hands On)-------------------------------------------------------------
+We will see how to eliminate the duplicate records while working with structured streaming.
+
+We will apply deduplication at the Silver-level rather than the Bronze-level.
+Remember, the bronze table should retain a history of the true state of our streaming source.
+
+
+In Spark structured streaming, We can also use the dropDuplicates() function.
+deduped_df = (spark.readStream
+                   .table("bronze")
+                   .filter("topic = 'orders'")
+                   .select(F.from_json(F.col("value").cast("string"), json_schema).alias("v"))
+                   .select("v.*")
+                   .withWatermark("order_timestamp", "30 seconds")
+                   .dropDuplicates(["order_id", "order_timestamp"]))
+				   
+:: Structured streaming can track state information for the unique keys in the data.
+This ensures that duplicate records do not exist within or between microbatches.
+
+-----------------------------------------------------------Extra Info
+:: What is State Information? -------------
+State = Memory Spark uses to remember things across micro-batches.
+For example, in deduplication:
+Spark needs to remember which keys (like order_id) have already been processed.
+
+This memory (state) is stored in an internal State Store (usually backed by RocksDB on disk, but conceptually like a key-value map in memory).
+Explantion of above statements:-
+Okay, let me explain this in very simple terms:
+
+How does it work?
+
+When Spark sees a record with order_id = 101 for the first time, it adds 101 to the state.
+If another record with order_id = 101 comes:
+
+Spark checks the state.
+If found → drop it (duplicate).
+If watermark expires, Spark removes old keys from the state to free memory.
+
+Why do we need State?
+
+Operations that need memory of past data:----
+Deduplication (dropDuplicates)
+Aggregations (groupBy with sum, count)
+Joins between streams or stream-static
+Session windows
+
+Without state, Spark would only see current micro-batch and forget everything else → duplicates between batches would slip through.
+
+How big can the state get?----
+Potentially huge if you track millions of keys.
+That’s why watermarks are used → to clear old state periodically.
+
+:: What does this mean ?--------
+Structured streaming can track state information for the unique keys in the data.
+This ensures that duplicate records do not exist within or between microbatches.
+
+Imagine you are running a small shop and you keep getting orders one by one throughout the day. 
+These orders come in small batches (like 10 orders every 10 seconds).
+
+Now, sometimes the same order might come twice by mistake (duplicate order). 
+You don’t want to process it twice because that would mess up your stock and billing.
+
+So, what do you do?
+
+You keep a notebook where you write down all the order IDs you’ve already seen.
+Every time a new order comes, you check the notebook:
+
+If it’s already there → you skip it (it’s a duplicate).
+If it’s not there → you process it and add it to the notebook.
+
+This notebook is like the state in Structured Streaming. 
+It remembers which keys (like order IDs) have been seen, even when data comes in separate batches (microbatches).
+
+Result: You never process the same order twice, no matter which batch it came in.
+
+Sample Data (Simulated Stream)
+Batch 1:  (order_id, amount)
+(101, 500), (102, 1000), (103, 750)
+
+Batch 2:
+(101, 500), (104, 1200), (105, 600)
+Here, order 101 appears again in batch 2 → duplicate.
+
+PySpark Structured Streaming Code
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, expr
+from pyspark.sql.types import StructType, StructField, IntegerType
+
+# 1. Create Spark Session
+spark = SparkSession.builder \
+    .appName("StatefulDeduplicationExample") \
+    .getOrCreate()
+
+# 2. Define schema for incoming orders
+schema = StructType([
+    StructField("order_id", IntegerType(), True),
+    StructField("amount", IntegerType(), True)
+])
+
+# 3. Read streaming data (simulate using rate source + map)
+orders_stream = spark.readStream \
+    .schema(schema) \
+    .json("/path/to/orders")  # This would be your input folder or Kafka topic
+
+# 4. Remove duplicates using stateful deduplication
+#    Structured Streaming remembers which order_ids it has already seen
+deduped_orders = orders_stream \
+    .withWatermark("timestamp", "10 minutes") \
+    .dropDuplicates(["order_id"])
+
+# 5. Write output to console
+query = deduped_orders.writeStream \
+    .outputMode("append") \
+    .format("console") \
+    .start()
+
+query.awaitTermination()
+
+What is a Watermark in Streaming?
+When streaming data keeps coming, we need to decide how long to keep old data in memory for operations like deduplication or joins. Otherwise, memory will keep growing forever.
+
+A watermark is a time limit that says:
+
+"I will only keep track of data for the last X amount of time. Anything older can be forgotten."
+
+Why do we need this?
+
+In the earlier example, we keep track of all processed order_ids so we don’t process duplicates.
+But what if:
+An order from yesterday comes again today?
+We cannot store all old order IDs forever (memory issue).
+
+So we say:
+“I only care about duplicates within the last 10 minutes.”
+If an order comes after 10 minutes, it is treated as new.
+
+How does withWatermark("timestamp", "10 minutes") work?
+"timestamp" → the column that has the event time of the record.
+"10 minutes" → the maximum delay we allow for late data and for keeping state.
+
+This means:
+If an event is more than 10 minutes late, we drop it (don’t process as duplicate , i.e insert as new record in target).
+If an event comes within 10 minutes, we check for duplicates in that 10-minute window.
+
+Scenario
+
+We have these records arriving with event timestamps:
+Batch 1 (at processing time 10:00:00):
+(101, 500, "10:00:00")
+(102, 1000, "10:01:00")
+
+
+Batch 2 (at processing time 10:08:00):
+(101, 500, "10:08:00")   <-- duplicate within 10 mins
+(103, 750, "10:07:00")
+
+
+Batch 3 (at processing time 10:15:00):
+(101, 500, "10:00:00")   <-- duplicate but timestamp is OLD (>10 mins late)
+(104, 1200, "10:14:00")
+
+Code Example
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.types import StructType, StructField, IntegerType, TimestampType
+
+spark = SparkSession.builder.appName("WatermarkExample").getOrCreate()
+
+# Define schema
+schema = StructType([
+    StructField("order_id", IntegerType(), True),
+    StructField("amount", IntegerType(), True),
+    StructField("timestamp", TimestampType(), True)  # Event time
+])
+
+# Read streaming data from a folder
+orders_stream = spark.readStream \
+    .schema(schema) \
+    .option("maxFilesPerTrigger", 1) \
+    .json("/path/to/orders")  # Folder where batches of JSON files arrive
+
+# Deduplicate based on order_id using watermark
+deduped_orders = orders_stream \
+    .withWatermark("timestamp", "10 minutes") \
+    .dropDuplicates(["order_id", "timestamp"])
+
+# Output to console
+query = deduped_orders.writeStream \
+    .outputMode("append") \
+    .format("console") \
+    .option("truncate", "false") \
+    .start()
+
+query.awaitTermination()
+
+
+Input Files Simulation
+
+File 1 (Batch 1):
+
+{"order_id":101,"amount":500,"timestamp":"2025-08-30T10:00:00"}
+{"order_id":102,"amount":1000,"timestamp":"2025-08-30T10:01:00"}
+
+
+File 2 (Batch 2):
+
+{"order_id":101,"amount":500,"timestamp":"2025-08-30T10:08:00"}
+{"order_id":103,"amount":750,"timestamp":"2025-08-30T10:07:00"}
+
+
+File 3 (Batch 3):
+
+{"order_id":101,"amount":500,"timestamp":"2025-08-30T10:00:00"}  // old duplicate (>10 mins late)
+{"order_id":104,"amount":1200,"timestamp":"2025-08-30T10:14:00"}
+
+✅ Expected Output in Console
+
+After Batch 1:
+
++--------+------+-------------------+
+|order_id|amount|timestamp          |
++--------+------+-------------------+
+|101     |500   |2025-08-30 10:00:00|
+|102     |1000  |2025-08-30 10:01:00|
++--------+------+-------------------+
+
+
+After Batch 2:
+
++--------+------+-------------------+
+|order_id|amount|timestamp          |
++--------+------+-------------------+
+|103     |750   |2025-08-30 10:07:00|
++--------+------+-------------------+
+
+
+(Order 101 is duplicate but within 10 mins, so dropped)
+
+After Batch 3:
+
++--------+------+-------------------+
+|order_id|amount|timestamp          |
++--------+------+-------------------+
+|101     |500   |2025-08-30 10:00:00| <-- OLD duplicate accepted (beyond 10 min watermark)
+|104     |1200  |2025-08-30 10:14:00|
++--------+------+-------------------+
+
+
+✅ Here you see:
+
+Watermark = 10 mins means after processing time has advanced by 10 mins, the engine forgets old keys.
+
+The old duplicate (101) came back too late → treated as new record.
+
+
+IMP:- When dealing with streaming duplication, there is another level of complexity compared to static data as each micro-batch is processed.
+We need also to ensure that records to be inserted are not already in the target table.
+
+✅ Why is this a problem?-------------
+
+In streaming, data comes in micro-batches every few seconds or minutes.
+Even if you use dropDuplicates() within the stream, you only deduplicate for the current state (within watermark time).
+
+But what about duplicates that already exist in the target table from earlier batches or previous runs?
+If you just do a simple INSERT, you risk adding the same record again → duplicate rows in the target table.
+
+What’s the solution? Insert-Only Merge
+
+Think of it like this:
+You have a guest list (target table).
+New guests arrive (streaming batch).
+
+Before adding each new guest to the list, you check if they’re already on the list:
+If already there → skip.
+If not there → add.
+
+This is insert-only merge:
+Only insert records if they do not exist in the target based on a unique key.
+
+✅ How does it work in Delta Lake (Databricks)?
+
+We use a MERGE INTO statement, but only the WHEN NOT MATCHED THEN INSERT clause.
+
+Example:
+
+MERGE INTO target_table AS tgt
+USING new_streaming_data AS src
+ON tgt.order_id = src.order_id
+WHEN NOT MATCHED THEN
+  INSERT (order_id, amount, timestamp)
+  VALUES (src.order_id, src.amount, src.timestamp);
+
+✅ What happens here?
+
+For every new record in the streaming batch (src):
+
+Spark checks the target_table for order_id.
+
+If found → do nothing (skip).
+
+If not found → insert the record.
+
+✅ Why is this good for streaming deduplication?
+
+Even if a duplicate comes in a later batch, it won’t be inserted because the target table already has it.
+
+This is stronger than watermark-based deduplication, because:
+
+Watermark only works within memory state and time window.
+
+Insert-only merge checks the actual target table (historical data).
+
+✅ Where is this used?
+
+Delta Lake + Structured Streaming on Databricks:
+
+(streaming_df.writeStream
+  .format("delta")
+  .foreachBatch(lambda batch_df, batch_id: (
+      batch_df.createOrReplaceTempView("updates"),
+      batch_df.sparkSession.sql("""
+        MERGE INTO target_table tgt
+        USING updates src
+        ON tgt.order_id = src.order_id
+        WHEN NOT MATCHED THEN INSERT *
+      """)
+  ))
+  .start())
+  
+-----------------------------------------------------------Extra Info Ended
+
+We can achieve this using insert-only merge.
+This operation is ideal for deduplication.
+It defines logic to match on unique keys,
+and only insert those records for keys that do not exist in the table.
+
+def upsert_data(microBatchDF, batch):
+    microBatchDF.createOrReplaceTempView("orders_microbatch")
+    
+    sql_query = """
+      MERGE INTO orders_silver a
+      USING orders_microbatch b
+      ON a.order_id=b.order_id AND a.order_timestamp=b.order_timestamp
+      WHEN NOT MATCHED THEN INSERT *
+    """
+    
+	#spark.sql(sql_query) Why not  used ??
+    microBatchDF.sparkSession.sql(sql_query)
+
+In this function, we first store the records we inserted into a temporary view called orders_microbatch.
+We then use this temporary view in our insert-only merge query.
+
+-----------------------------------------------------------Extra Info
+
+✅ Why not use spark.sql(sql_query) directly inside foreachBatch?
+
+Lastly, we execute this query using spark SQL function.
+However, in this particular case, the spark session cannot be accessed from within the microbatch process.
+Instead, we can access the local spark session from the microbatch data frame.
+
+When you define a foreachBatch function like:
+
+def upsert_data(microBatchDF, batch_id):
+    microBatchDF.createOrReplaceTempView("orders_microbatch")
+    spark.sql(sql_query)  # <-- why is this a problem?
+
+
+The variable spark here refers to the global SparkSession that you created outside the function.
+However, when foreachBatch runs:
+
+It executes on the driver for each batch.
+
+In some scenarios (especially in cluster mode or multi-session jobs), that global spark session reference might not be accessible in the function context because Spark jobs are serialized and sent to executors.
+
+
+Meaning of Spark jobs are serialized and sent to executors..
+✅ Spark Architecture Basics
+
+Driver Node:
+Runs the SparkSession (the main entry point for Spark).
+Plans the job (creates the DAG of tasks).
+Schedules and sends serialized tasks to executors on worker nodes.
+
+Executor Nodes:
+Run the tasks.
+Do the actual computation on data partitions.
+They do not have the full SparkSession object like the driver does.
+Executors only have serialized instructions and necessary variables sent from the driver.
+
+This can cause:
+Serialization issues.
+
+NameError: name 'spark' is not defined if the session object isn’t available in the serialized closure.
+
+✅ Why use microBatchDF.sparkSession.sql() instead?
+microBatchDF (the batch DataFrame) always has a reference to the SparkSession that created it.
+This is guaranteed because the DataFrame API needs it to execute transformations and actions.
+
+So, calling:
+microBatchDF.sparkSession.sql(sql_query)
+
+ensures that we are using the correct SparkSession associated with the streaming query, even in distributed execution.
+
+✅ In short:
+spark (global variable) may not be accessible or correct inside the function.
+microBatchDF.sparkSession is always the right session, local to that batch.
+
+✅ Why is this important for Structured Streaming?
+Each micro-batch runs as a small job, and Spark needs the correct session to run SQL.
+Using the DataFrame’s own session avoids context mismatches in multi-user or cluster mode.
+
+
+----Working of spark session on driver---------
+✅ Static Data (spark.sql(...))
+
+When you run:
+df = spark.sql("SELECT * FROM my_table")
+
+
+Here’s what happens:
+Step 1: SparkSession on Driver
+spark.sql() is called on the driver.
+The SparkSession on the driver:
+
+Parses the SQL query.
+Builds a logical plan → optimizes it → converts it into a physical plan.
+Splits the physical plan into tasks.
+
+Step 2: Send Tasks to Executors
+The driver sends serialized tasks (not the SparkSession!) to the executors.
+These tasks include:
+Which partitions to read.
+What operations to apply (filter, project, aggregate, etc.).
+Instructions for shuffle if needed.
+
+Step 3: Executors Do the Work
+Executors:
+Read the data (from HDFS, Delta Lake, Parquet, etc.).
+Apply transformations locally.
+Produce intermediate results (e.g., partial aggregates).
+Executors do not need SparkSession because: They already have the execution plan.
+Their job is to execute the plan on their partition.
+
+Step 4: Collect Results
+If you call df.show() or df.collect():
+Executors send final results (or partial results) back to the driver.
+
+If you call df.write.parquet(...):
+Executors write the output files themselves, not the driver.
+✅ So, SparkSession stays on the driver and is only used for:
+
+Planning
+Optimization
+Job coordination
+Executors are stateless workers that just execute the plan given to them.
+
+-----------------------------------------------------------Extra Info Ended
+
+IMP:- In order to code the upsert function in our stream, we need to use the foreachBatch method.
+This provides the option to execute custom data writing logic on each micro batch of a streaming data.
+
+query = (deduped_df.writeStream
+                   .foreachBatch(upsert_data)
+                   .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/orders_silver")
+                   .trigger(availableNow=True)
+                   .start())
+
+query.awaitTermination()
+
+Let us see the number of entries that have been processed into the orders_silver table.
+Indeed, the number of unique records match between our batch and streaming deduplication queries.
+
+batch_total = (spark.read
+                      .table("bronze")
+                      .filter("topic = 'orders'")
+                      .select(F.from_json(F.col("value").cast("string"), json_schema).alias("v"))
+                      .select("v.*")
+                      .dropDuplicates(["order_id", "order_timestamp"])
+                      .count()
+                )
+				
+				
+streaming_total = spark.read.table("orders_silver").count()
+
+print(f"batch total: {batch_total}")
+print(f"streaming total: {streaming_total}")
+
+batch total: 800
+streaming total: 800
+
+13. Slowly Changing Dimensions)-------------------------------------------------------------
+Slowly Changing Dimensions, or SCD is a data management concept that determines how tables handle data which change over time.
+
+For example, whether you want to overwrite values in the table or maybe retain their history.
+This can be determined by the SCD type to implement.
+
+Types of Slowly Changing Dimensions (SCD):
+1. Type 0 - In a type 0 SCD table, No change is allowed.
+Tables of this type are either static or append-only tables. For example, static lookup tables. 
+
+2. In a Type 1 SCD table, no history retained.
+When new data arrives, the old attributes values in the table's rows are overwritten with the new values.
+
+Type 1 - In a type 1 SCD table.
+The new data overwrite the existing one.
+Thus, the existing data is lost as it is not stored anywhere else.
+This type is useful only when you care about the current values rather than historic comparisons.
+
+
+3. Type 2 - While in a type 2 SCD table, a new record is added with the changed data values.
+And this new record becomes the current active record, while the old record is marked as no longer active.
+So, type 2 SCD retains the full history of values.
+
+While in SCD Type 2, table full changes history is retained.
+
+In order to support SCD Type 2 changes, we need to add three columns to our table.
+
+A Current column : which is a flag that indicates whether the record is the current version or not.
+Effective or Start Date: the date from which the record version is active.
+And lastly, the End Date: the date to which the record version was active.
+
+Note:- Now, you may think, why not using Delta Time Travel feature to access the historical versions of the data that changes?
+In fact, Delta time travel does not scale well in cost and latency to provide a long term versioning solution.
+And remember, running a vacuum command will cause the table historical versions to be deleted.
+
+
+14. Type 2 SCD (Hands On)-------------------------------------------------------------
+
+In SCD Type 2, old records need to be marked as no longer valid.
+For this, we use the book_id as a merge key.
+
+So when there is an update matched with a currently active record in the table,
+we update this record's current status to false, and we set its end_date.
+
+In the same time, the received updates need to be inserted as separate records.
+This is why we are reprocessing them with a null merge key.
+
+This allows to insert these updates using the NOT MATCHED clause.
+And notice here that we are inserting the new records with a current status equal true, and without end_date
+
+def type2_upsert(microBatchDF, batch):
+    microBatchDF.createOrReplaceTempView("updates")
+    
+    sql_query = """
+        MERGE INTO books_silver
+        USING (
+            SELECT updates.book_id as merge_key, updates.*
+            FROM updates
+
+            UNION ALL
+
+            SELECT NULL as merge_key, updates.*
+            FROM updates
+            JOIN books_silver ON updates.book_id = books_silver.book_id
+            WHERE books_silver.current = true AND updates.price <> books_silver.price
+          ) staged_updates
+        ON books_silver.book_id = merge_key 
+        WHEN MATCHED AND books_silver.current = true AND books_silver.price <> staged_updates.price THEN
+          UPDATE SET current = false, end_date = staged_updates.updated
+        WHEN NOT MATCHED THEN
+          INSERT (book_id, title, author, price, current, effective_date, end_date)
+          VALUES (staged_updates.book_id, staged_updates.title, staged_updates.author, staged_updates.price, true, staged_updates.updated, NULL)
+    """
+    
+    microBatchDF.sparkSession.sql(sql_query)
+
+
+def process_books():
+    schema = "book_id STRING, title STRING, author STRING, price DOUBLE, updated TIMESTAMP"
+ 
+    query = (spark.readStream
+                    .table("bronze")
+                    .filter("topic = 'books'")
+                    .select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
+                    .select("v.*")
+                 .writeStream
+                    .foreachBatch(type2_upsert)
+                    .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/books_silver")
+                    .trigger(availableNow=True)
+                    .start()
+            )
+    
+    query.awaitTermination()
+    
+process_books()
+
+
+SECTION 3: Data Processing-------------------------------------------------------------
+
+15. Change Data Capture----------------------------------------------------------
+
+Change Data Capture or CDC refers to the process of identifying and capturing changes made to data in
+the data source, and then delivering those changes to the target.
+
+Those changes could be:-
+> Inserting new records
+> Update existing records
+> Delete existing records
+
+Note: Changes are logged at the ``source`` as events that contain both the data of the records along with metadata information.
+
+These metadata indicate whether the specified record was inserted, updated or deleted.
+In addition to a version number or timestamp indicating the order in which changes happened.
+
+Here is an example of CDC events need to be applied on our target table.
+Country ID | Country | Vaccination Rate |	Sequence		|	operation
+FR 			France 		0.74 				2022-11-01 07:00 	UPDATE
+FR 			France 		0.75 				2022-11-01 08:00 	UPDATE
+CA 											2022-1101 00:00 	DELETE
+US 			USA 		05 					2022-11-01 00:00 	INSERT
+IN 			India 		0.66 				2022-11-01 00:00 	INSERT
+
+France, for example, has two records, so we need to apply the most recent change.
+Canada needs to be deleted.
+So we don't need to send all the data of the record.
+Lastly, USA and India are new records need to be inserted.
+Here we see the changes applied on our target table.
+And of course, we don't see the record of Canada as it has been deleted.
+
+Country ID | Country | Vaccination Rate
+FR 			France 		0.75
+USA			USA 		0.5
+IN 			India 		0.66
+
+
+Such a CDC feed could be received from the source as a data stream or simply in JSON files, for example.
+
+In Delta Lake, you can process CDC feed using the MERGE INTO command.
+
+MERGE INTO command allows you to merge a set of updates, insertions and deletions based
+on a source table into a target delta table.
+
+MERGE INTO target_table t
+USING source_updates s 
+ON t.key_field = s.key_field 
+	WHEN MATCHED AND t.sequence_field < s.sequence_field 
+		THEN UPDATE SET * 
+	WHEN MATCHED AND s.operation_field = "DELETE" 
+		THEN DELETE 
+	WHEN NOT MATCHED 
+		THEN INSERT * 
+
+Merge Limitation---------
+> Merge can not be performed if multiple source rows matched and
+attempted to modify the same target row in the Delta table
+
+> CDC feed with multiple updates for the same key will generate an exception.
+
+-----------------------------------------------------------Extra Info
+🔎 Why MERGE Fails with Multiple Matches ?
+
+The MERGE command in Delta Lake expects that each target row is matched at most once in a single operation.
+
+If your CDC feed has multiple rows with the same key (e.g., the same cust_id) in the same batch, 
+Spark tries to apply multiple updates/inserts/deletes to the same target row → ambiguity.
+
+📌 Example
+
+Suppose target has:
+
+cust_id | name  | state
+--------|-------|------
+101     | John  | CA
+
+
+CDC feed (same batch):
+
+cust_id | name  | state | op
+--------|-------|-------|---
+101     | John  | NY    | UPDATE
+101     | John  | TX    | UPDATE
+
+
+When MERGE runs, both NY and TX rows match the same cust_id=101.
+
+Delta doesn’t know: should the row end up as NY or TX?
+
+❌ Exception is raised.
+
+Result: Detected multiple source rows matching the same target row exception 🚨
+
+-----------------------------------------------------------Extra Info Ended
+
+> To avoid this error, you need to ensure that you are merging only the most recent changes.
+
+This can be achieved using the rank window function.
+
+This ranking function assigns a rank number for each row within a window.
+A window is a group of records having the same partitioning key, and sorted by an ordering column in descending order.
+So the most recent record for each key will have the rank 1.
+
+Now we can filter to keep only records having rank equal 1 and merge them into our target table using
+MERGE INTO command.
+
+-----------------------------------------------------------Extra Info
+⚙️ How to Handle This in CDC Pipelines
+
+You need to deduplicate or sequence the change records before the MERGE.
+Common strategies:
+
+1. Deduplicate by latest timestamp
+
+If CDC feed has a column like op_ts or last_modified, keep only the latest event per key in the batch.
+
+SELECT *
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY op_ts DESC) AS rn
+    FROM cdc_feed
+) tmp
+WHERE rn = 1
+
+
+2. Apply business rules
+
+If multiple updates come, you may prefer:
+Latest timestamp wins (last update of the day).
+
+Highest priority op wins (DELETE > UPDATE > INSERT).
+Or accumulate them sequentially across micro-batches instead of same batch.
+
+3. Process sequentially in streaming
+If you’re using Structured Streaming, micro-batches are small. You can configure ingestion so that only one change per key appears per batch.
+
+4. Staging table approach
+
+Write all changes into a staging Delta table.
+Deduplicate / resolve conflicts there.
+Then run MERGE from the staging table into the main dimension/fact table.
+
+🔁 1. Latest Update Wins (most common)
+
+Keep only the latest record per key in the batch based on timestamp.
+
+When to use:
+
+You just need the most recent state (no history).
+
+Example: Customer’s current address.
+
+SQL Example:
+WITH staged AS (
+  SELECT *
+  FROM (
+    SELECT src.*, 
+           ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY op_ts DESC) as rn
+    FROM changes src
+  ) tmp
+  WHERE rn = 1
+)
+MERGE INTO delta.`/mnt/dim_customer` AS tgt
+USING staged AS src
+ON tgt.cust_id = src.cust_id
+
+WHEN MATCHED AND src.op = 'DELETE' THEN DELETE
+WHEN MATCHED AND src.op = 'UPDATE' THEN
+  UPDATE SET tgt.name = src.name, tgt.state = src.state
+WHEN NOT MATCHED AND src.op = 'INSERT' THEN
+  INSERT (cust_id, name, state)
+  VALUES (src.cust_id, src.name, src.state)
+
+
+✅ If two updates (NY, TX) come in same batch, only TX (latest by timestamp) is applied.
+
+⚖️ 2. Operation Priority (business rules)
+
+Resolve conflicts by applying ops in a fixed priority order.
+
+When to use:
+
+If an UPDATE and DELETE happen for same key in the same batch, you want to ensure DELETE wins.
+
+Example: CRM feeds where delete is more important than update.
+
+Logic:
+
+Define priority:
+DELETE > UPDATE > INSERT (or custom order).
+
+SQL Example:
+WITH staged AS (
+  SELECT *
+  FROM (
+    SELECT src.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id 
+               ORDER BY CASE src.op 
+                          WHEN 'DELETE' THEN 1
+                          WHEN 'UPDATE' THEN 2
+                          WHEN 'INSERT' THEN 3
+                        END
+               , op_ts DESC
+           ) as rn
+    FROM changes src
+  ) tmp
+  WHERE rn = 1
+)
+MERGE INTO delta.`/mnt/dim_customer` AS tgt
+USING staged AS src
+ON tgt.cust_id = src.cust_id
+
+WHEN MATCHED AND src.op = 'DELETE' THEN DELETE
+WHEN MATCHED AND src.op = 'UPDATE' THEN
+  UPDATE SET tgt.name = src.name, tgt.state = src.state
+WHEN NOT MATCHED AND src.op = 'INSERT' THEN
+  INSERT (cust_id, name, state)
+  VALUES (src.cust_id, src.name, src.state)
+
+
+✅ Example: If you get both an UPDATE → NY and DELETE for cust_id=101, the DELETE wins.
+
+📚 3. Full SCD2 Expansion (preserve history)
+
+Instead of collapsing changes, apply all updates in order.
+This gives you a Type 2 Slowly Changing Dimension table.
+
+When to use:
+
+You need history of changes.
+
+Example: Customer state change tracking.
+
+Strategy:
+
+Use merge_key=NULL trick (as we discussed before) or sequential staging.
+
+Close old record (is_current=0, end_date=today) when state changes.
+
+Insert a new record for every change.
+
+SQL Example (simplified):
+WITH dedup_updates AS (
+    SELECT *
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY op_ts DESC) AS rn
+        FROM updates
+    ) tmp
+    WHERE rn = 1
+),
+
+staged AS (
+    -- Updates matched to close old rows
+    SELECT dedup_updates.cust_id AS merge_key, dedup_updates.*
+    FROM dedup_updates
+    
+    UNION ALL
+    
+    -- Inserts for history
+    SELECT NULL AS merge_key, dedup_updates.*
+    FROM dedup_updates
+    JOIN tgt
+      ON dedup_updates.cust_id = tgt.cust_id
+     AND tgt.is_current = 1
+     AND dedup_updates.state IS DISTINCT FROM tgt.state
+)
+MERGE INTO delta.`/mnt/dim_customer` AS tgt
+USING staged AS src
+ON tgt.cust_id = src.merge_key
+
+WHEN MATCHED AND tgt.is_current = 1 AND tgt.state <> src.state THEN
+    UPDATE SET tgt.is_current = 0, tgt.end_date = current_date()
+
+WHEN NOT MATCHED THEN
+    INSERT (cust_id, name, state, is_current, start_date, end_date)
+    VALUES (src.cust_id, src.name, src.state, 1, current_date(), NULL)
+
+
+✅ Example:
+
+CDC feed has (CA → NY, then NY → TX) in same batch.
+
+Final table will have 3 rows:
+
+CA (historical, closed)
+
+NY (historical, closed)
+
+TX (current, open).
+
+⚡ Summary Playbook
+
+Latest update wins → best for current state only.
+
+Operation priority → best for conflicting ops (DELETE vs UPDATE).
+
+SCD2 expansion → best for full history/audit trails.
+
+Great 👍 Let’s visualize how the three CDC deduplication strategies behave differently.
+We’ll use the same input CDC feed for all three cases.
+
+📥 Input (CDC feed for cust_id=101 in the same batch)
+cust_id | name  | state | op     | op_ts
+--------|-------|-------|--------|-------------------
+101     | John  | NY    | UPDATE | 2025-08-30 10:00
+101     | John  | TX    | UPDATE | 2025-08-30 10:05
+101     | John  | null  | DELETE | 2025-08-30 10:10
+
+
+So in one batch, we got two updates and a delete.
+
+1️⃣ Latest Update Wins
+
+Keep only the last change by timestamp (DELETE at 10:10).
+
+Target table result:
+
+cust_id | name | state |   status
+--------|------|-------|------------
+101     | John | null  | ❌ deleted
+
+
+👉 Only the final state matters.
+
+2️⃣ Operation Priority (DELETE > UPDATE > INSERT)
+
+Apply business rule priority: delete always wins if present.
+
+Target table result:
+
+cust_id | name | state |   status
+--------|------|-------|------------
+101     | John | null  | ❌ deleted
+
+
+👉 Same as “latest wins” in this case, but different if DELETE came earlier.
+E.g., if order was UPDATE → DELETE → UPDATE, then:
+
+Latest wins = UPDATE survives ✅
+
+Priority = DELETE wins ❌
+
+3️⃣ Full SCD2 Expansion (History Preserved)
+
+Instead of collapsing, we keep every change as a new row.
+We close previous rows (is_current=0) and mark the latest as is_current=1.
+
+Target table result:
+
+cust_id | name | state | is_current | start_date | end_date
+--------|------|-------|------------|------------|----------
+101     | John | CA    | 0          | 2025-01-01 | 2025-08-30
+101     | John | NY    | 0          | 2025-08-30 | 2025-08-30
+101     | John | TX    | 0          | 2025-08-30 | 2025-08-30
+101     | John | null  | 1          | 2025-08-30 | NULL
+
+
+👉 You now see the entire journey of the customer (CA → NY → TX → deleted).
+
+🖼️ Side-by-Side Comparison (Diagram)
+Input CDC Feed:  [ UPDATE:NY → UPDATE:TX → DELETE ]
+
+Latest Update Wins   → final state only → row deleted
+Operation Priority   → rule applied (DELETE wins) → row deleted
+SCD2 Expansion       → full history → CA, NY, TX, deleted row
+
+
+✅ So in short:
+
+Latest update wins = quick, simplest, gives current state.
+
+Priority rules = good when DELETEs must dominate.
+
+SCD2 expansion = full lineage & history.
+
+-----------------------------------------------------------Extra Info Ended
+
+16. Processing CDC Feed (Hands On)-------------------------------------------------------------
+
+In this demo, we will create our customers silver table.
+The data in the customers topic contains complete row output from a Change Data Capture feed.
+The changes captured are either insert, update or delete.
+
+Let us take a look on our customers data.
+Here as before we filter for the customers topic.
+Unpack all the JSON fields from the value column into the correct schema.
+
+In addition, we will process only insert and update in this notebook.
+
+from pyspark.sql import functions as F
+
+schema = "customer_id STRING, email STRING, first_name STRING, last_name STRING, gender STRING, street STRING, city STRING, country_code STRING, row_status STRING, row_time timestamp"
+
+customers_df = (spark.table("bronze")
+                 .filter("topic = 'customers'")
+                 .select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
+                 .select("v.*")
+                 .filter(F.col("row_status").isin(["insert", "update"])))
+
+
+We have previously explored dropDuplicates function to remove exact duplicates.
+
+However, here the problem is different since records are not identical for the same primary key.
+
+The solution to keep only the most recent change is to use the rank window function.
+
+This ranking function assigns a rank number for each row within a window.
+A window is a group of ordered records having the same partition key.
+
+In our case the customer ID.
+And we sort the records within our window by the row time in descending order.
+So the most recent record for each customer ID will have the rank 1.
+Now we can filter to keep only records having rank equal 1 and drop the rank column as it is no more needed.
+
+from pyspark.sql.window import Window
+
+window = Window.partitionBy("customer_id").orderBy(F.col("row_time").desc())
+
+ranked_df = (customers_df.withColumn("rank", F.rank().over(window))
+                          .filter("rank == 1")
+                          .drop("rank"))
+						  
+						  
+Let us try to apply this logic to a streaming read.
+Interesting.
+As you can see, such a window operation is not supported on streaming data frames.
+
+# This will throw an exception because non-time-based window operations are not supported on streaming DataFrames.
+ranked_df = (spark.readStream
+                   .table("bronze")
+                   .filter("topic = 'customers'")
+                   .select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
+                   .select("v.*")
+                   .filter(F.col("row_status").isin(["insert", "update"]))
+                   .withColumn("rank", F.rank().over(window))
+                   .filter("rank == 1")
+                   .drop("rank")
+             )
+
+display(ranked_df)
+
+
+To avoid this restriction we can use foreachBatch logic.
+Inside the streaming micro batch process,
+
+from pyspark.sql.window import Window
+
+def batch_upsert(microBatchDF, batchId):
+    window = Window.partitionBy("customer_id").orderBy(F.col("row_time").desc())
+    
+    (microBatchDF.filter(F.col("row_status").isin(["insert", "update"]))
+                 .withColumn("rank", F.rank().over(window))
+                 .filter("rank == 1")
+                 .drop("rank")
+                 .createOrReplaceTempView("ranked_updates"))
+    
+    query = """
+        MERGE INTO customers_silver c
+        USING ranked_updates r
+        ON c.customer_id=r.customer_id
+            WHEN MATCHED AND c.row_time < r.row_time
+              THEN UPDATE SET *
+            WHEN NOT MATCHED
+              THEN INSERT *
+    """
+    
+    microBatchDF.sparkSession.sql(query)
+
+we can interact with our data using batch syntax instead of streaming syntax.
+So here we simply process the records of each batch before merging them into the target table.
+
+We start by computing the newest entries based on our window.
+And we store them in a temporary view called ranked_updates.
+
+Next we merge these ranked updates into our customer table based on the customer ID key.
+If the key already exists in the table, we update the record.
+And if the key does not exist, we insert the new record.
+
+Note : Here CDC is applied in merge logic using c.row_time < r.row_time, so that the target gets updated only if 
+the source value is having the latest data version or timestamp.
+
+If we were interested by applying delete changes also.
+We could simply add another condition for this in our merge statement.
+For now, let us remove this part since we are going to process deletes later on.
+
+
+Now let us create our customers target table.
+Notice here that we are adding country name instead of the country code received in our customers data.
+
+For this we will perform a join with a country lookup table.
+Let us take a look on this lookup table.
+So it mainly contained the country code and the country name.
+Now we can write our streaming query.
+
+query = (spark.readStream
+                  .table("bronze")
+                  .filter("topic = 'customers'")
+                  .select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
+                  .select("v.*")
+                  .join(F.broadcast(df_country_lookup), F.col("country_code") == F.col("code") , "inner")
+               .writeStream
+                  .foreachBatch(batch_upsert)
+                  .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/customers_silver")
+                  .trigger(availableNow=True)
+                  .start()
+          )
+
+
+Here we enrich our customer data by performing a joint with the country lookup table.
+
+Notice here that we suggest using broadcast join with this small lookup table.
+
+Broadcast join is an optimization technique where the smaller data frame will be sent to all executer nodes in the cluster.
+
+To allow a broadcast join.
+You just need to mark which data frame is small enough for broadcasting using the broadcast() function.
+
+This gives a hint to Spark that these dataframe can fit in memory on all executors.
+
+
+Next we use foreachBatch to merge the newest changes.
+And lastly, we run a trigger available now batch to process all records.
+Let us run this streaming query and wait for its termination.
+
+query.awaitTermination()
+
+# COMMAND ----------
+
+count = spark.table("customers_silver").count()
+expected_count = spark.table("customers_silver").select("customer_id").distinct().count()
+
+assert count == expected_count
+print("Unit test passed.")
+
+
+Now the customers table should have only one record for each unique ID.
+Let us confirm this.
+
+Indeed the total number of records in our table equal to the unique number of customer IDs.
+Notice here that we are using assert statement to verify if the table count meets our expected distinct count.
+
+Assertions are boolean expressions that check if a statement is true or false.
+They are used in unit tests to check if certain assumptions remain true while you are developing your code.
+
+
+
+17. Delta Lake CDF----------------------------------------------------------
+
+Change Data Feed or CDF is a new feature built into Delta Lake that allows to automatically generate CDC feeds about Delta Lake tables.
+
+>CDF records row-level changes for all the data written into a delta table.
+These include the raw data along with metadata indicating whether the specified row was inserted, deleted or updated.
+» Row data + metadata (whether row was inserted, deleted, or updated)
+
+CDF is used to propagate incremental changes to downstream tables in a multi-hop architecture.
+
+Here is a simple example of a delta table with three records in its version one.
+
+Delta Table V1
+
+Country ID | Country | Vaccination Rate
+FR 			france 		0.7
+CA 			Canada 		0.65
+IN 			India 		0.6
+
+
+Delta Table V2
+Now, when we merge some updates on this table, like updating the value of France, and inserting a new record for USA
+Country ID | Country | Vaccination Rate
+FR 			france 		0.75 			(updated)
+CA 			Canada 		0.65
+IN 			India 		0.6
+US			USA			0.5				(Insert)
+
+If CDF is enabled on the table, it will automatically captures these changes.
+In the table_changes, CDF records the row data along with the change type, indicating whether the specified row was inserted, updated or deleted.
+And the timestamp associated when the change was applied.
+In addition, it records the Delta table version containing the change.
+
+In our case, version 2.
+Note:- Update operations in the table_changes have always two records present with pre-image and post-image change type.
+
+table_changes
+Country ID | Country | Vaccination Rate	| 	Change Type 	|	Time 		| Version |
+FR 			france 		0.7 				update _preimage 	07:00:00 		2
+FR 			France 		0.75 				update_postimage 	07:00:00 		2
+us 			USA 		0.5 				insert 				07:00:00 		2
+
+This records the row values before and after the update, which can be used to evaluate the differences in the changes if needed.
+
+And as you can see, Canada and India records in our example didn't receive any update or delete, so
+it will not be output by CDF.
+
+Delta Table V3
+Now if we delete the Canada record, for example
+Country ID | Country | Vaccination Rate
+FR 			france 		0.75 			(updated)
+IN 			India 		0.6
+US			USA			0.5				(Insert)
+
+CDF will record a Delete change type for this row.
+
+table_changes
+Country ID | Country | Vaccination Rate	| 	Change Type 	|	Time 		| Version |
+FR 			france 		0.7 				update _preimage 	07:00:00 		2
+FR 			France 		0.75 				update_postimage 	07:00:00 		2
+us 			USA 		0.5 				insert 				07:00:00 		2
+CA			CANADA		0.65				delete				08:00:00		3
+
+
+We query the change data of a table starting from a specific table version.
+Simply, we use SELECT * From table_changes and we specify the table name and the starting version.
+
+» SELECT *
+FROM table_changes('table_name’, start_version, [end_version])
+
+» SELECT *
+FROM table_changes('table_name’, start_timestamp, [end_timestamp])
+
+
+This returns the changes from the specified version to the latest version of the table.
+Instead, you can use an ending version to limit the versions retrieved if needed.
+
+Alternatively, you can provide a timestamp for the start and end limits.
+
+Note:- CDF is not enabled by default.
+You can explicitly enable it using one of the following methods.
+
+CDF is not enabled by default.
+You can explicitly enable it using one of the following methods.
+
+And on all newly created Delta tables, you can use Spark configuration settings to set this property to true
+in a notebook or on a cluster.
+
+» New tables
+» CREATE TABLE myTable (id INT, name STRING)
+TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+» Existing table
+» ALTER TABLE myTable
+SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+» All new tables
+» spark.databricks.delta.properties.defaults.enableChangeDataFeed
+
+CDF retention-----
+CDF data follows the same retention policy of the table.
+Therefore, if you run a VACUUM command on the table, CDF data is also deleted.
+
+When to use CDF------
+Use CDF when
+» Table's changes include updates and/or deletes
+Generally speaking, we use CDF for sending incremental data changes to downstream tables in a multi-hop architecture
+These changes should include updates and deletes.
+
+Use CDF when only a small fraction of records updated in each batch
+Such updates usually received from external sources in CDC format.
+
+» Don't use CDF when
+Table's changes are append only
+
+On the other hand, don't use if most of the records in the table are updated or if the table is completely
+overwritten in each batch.
+If these changes are append-only, then there is no need to use CDF.
+We can directly stream these changes from the table.
+
+-----------------------------------------------------------Extra Info
+
+🔹 1. What is Change Data Feed (CDF)?
+
+Change Data Feed is a Delta Lake feature that tracks row-level changes in a Delta table.
+
+Instead of reading the entire table to process updates, you can query only the changes that happened between two versions or timestamps.
+
+CDF captures three types of changes:
+
+Insert → a new row was added
+
+Update → an existing row was modified (returns preimage and postimage)
+
+Delete → a row was deleted
+
+This allows you to incrementally process changes, which is crucial for CDC pipelines, SCD2 tables, and efficient ETL.
+
+🔹 2. Enabling Change Data Feed
+
+You need to enable CDF on a Delta table:
+
+ALTER TABLE delta.`/mnt/dim_customer`
+SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+
+✅ Once enabled, every write operation on the table (insert/update/delete) will be tracked.
+
+🔹 3. How to Query Changes
+
+Use the table_changes function:
+
+SELECT * 
+FROM table_changes('delta.`/mnt/dim_customer`', <start_version>, <end_version>);
+
+
+<start_version> → the version you want to start reading changes from
+
+<end_version> → the version you want to read up to
+
+Output includes _change_type column:
+
+_change_type	cust_id	name	state
+insert	101	John	CA
+update_preimage	101	John	CA
+update_postimage	101	John	NY
+delete	101	John	NY
+
+_change_type = insert → row was newly added
+
+_change_type = update_preimage → row before update
+
+_change_type = update_postimage → row after update
+
+_change_type = delete → row deleted
+
+This is very useful for SCD2 pipelines: the preimage tells you what to close, and the postimage tells you what to insert as a new version.
+
+🔹 4. How CDF Works Internally
+
+Delta Table Versioning
+
+Delta Lake maintains versioned snapshots of the table.
+
+Every write (insert/update/delete) creates a new version.
+
+Change Tracking
+
+CDF leverages Delta transaction logs to track row-level changes.
+
+Each change has metadata (_commit_version, _change_type) and the row values.
+
+Reading Changes
+
+When you call table_changes(start_version, end_version), Delta scans the transaction logs between those versions, reconstructs changed rows, and returns them with _change_type.
+
+🔹 5. Benefits of Using CDF
+
+Incremental Processing
+
+Only process changed rows → faster pipelines.
+
+SCD2 / History Tracking
+
+Easily implement Type 2 Slowly Changing Dimensions.
+
+_change_type provides preimage and postimage for updates.
+
+Audit Trail / Data Lineage
+
+You can replay changes for any version.
+
+Safe Merge Operations
+
+Avoid MERGE exceptions due to multiple updates per key in a batch.
+
+You can stage CDF output before merging.
+
+Integration with Streaming
+
+CDF can be used in structured streaming to process incremental changes in real-time.
+
+🔹 6. Example: Using CDF for SCD2
+-- Read changes from version 3 to 5
+WITH cdc AS (
+    SELECT *, _change_type
+    FROM table_changes('delta.`/mnt/dim_customer`', 3, 5)
+)
+MERGE INTO delta.`/mnt/dim_customer_scd2` AS tgt
+USING cdc AS src
+ON tgt.cust_id = src.cust_id AND tgt.is_current = 1
+
+-- Close old rows
+WHEN MATCHED AND src._change_type='update_postimage' AND tgt.state <> src.state THEN
+  UPDATE SET tgt.is_current = 0, tgt.end_date = current_date()
+
+-- Insert new version
+WHEN NOT MATCHED AND src._change_type IN ('insert', 'update_postimage') THEN
+  INSERT (cust_id, name, state, is_current, start_date, end_date)
+  VALUES (src.cust_id, src.name, src.state, 1, current_date(), NULL);
+
+
+Behavior:
+
+_change_type = update_postimage → close old row (is_current=0) and insert new row
+
+_change_type = insert → insert new row
+
+_change_type = delete → optional: you can mark is_current=0 or remove row
+
+🔹 7. Visual Example (Timeline)
+
+Input Changes:
+
+Version	cust_id	name	state	_change_type
+3	101	John	CA	insert
+4	101	John	NY	update_postimage
+5	101	John	TX	update_postimage
+5	101	John	TX	delete
+
+SCD2 Output Table:
+
+cust_id	name	state	is_current	start_date	end_date
+101	John	CA	0	2025-01-01	2025-08-30
+101	John	NY	0	2025-08-30	2025-08-30
+101	John	TX	0	2025-08-30	2025-08-30
+101	John	null	1	2025-08-30	NULL
+
+✅ You can now replay any range of versions or incrementally update downstream tables without scanning the full table.
+
+🔹 TL;DR
+
+CDF = incremental row-level change tracking for Delta tables
+
+Tracks insert, update (pre/post), delete
+
+Perfect for SCD2, CDC, incremental ETL, streaming pipelines
+
+Avoids full table scans → efficient, scalable, and safe
+
+
+-----------------------------------------------------------Extra Info Ended
+
+18. CDF (Hands On)-----------------------------------------------------------
+
+Imp : - Editing table properties will add a new version to the table.
+
+In Python, we can read the recorded data by adding two options to a read stream query which are readChangeData
+with a value true, and the starting version.
+cdf_df = (spark.readStream
+               .format("delta")
+               .option("readChangeData", True)
+               .option("startingVersion", 2)
+               .table("customers_silver"))
+
+display(cdf_df)
+
+
+Let us now see what happened in the table directory in the underlying storage.
+Here we see that there is an additional metadata directory nested in our table directory called _change_data
+
+files = dbutils.fs.ls("dbfs:/user/hive/warehouse/bookstore_eng_pro.db/customers_silver")
+display(files)
+
+_change_data
+_delta_log
+part1
+part2
+...
+
+Let us take a look into this folder.
+As you can see, this directory contains parquet files where the CDF is recorded.
+files = dbutils.fs.ls("dbfs:/user/hive/warehouse/bookstore_eng_pro.db/customers_silver/_change_data")
+display(files)
+
+19. Stream-Stream Joins (Hands On)-----------------------------------------------------------
+
+-----------------------------------------------------------Extra Info
+
+What is a Stream-Stream Join?
+
+A Stream-Stream join means joining two continuously arriving datasets (streams) together in real time.
+
+Example:
+
+Stream A: Orders (user places an order)
+
+Stream B: Payments (user makes a payment)
+👉 You want to join them by order_id to see if an order is paid.
+
+🔹 Why are they tricky?
+
+Unlike static tables (batch), in streaming both inputs are unbounded and arriving continuously.
+
+We can’t wait forever to find a matching row.
+
+So Spark requires time bounds (watermark + windowing) to ensure it eventually clears old data and doesn’t keep infinite state.
+
+🔹 Types of Stream Joins in Spark
+
+Inner Join
+
+Output only when records exist in both streams within the allowed time range.
+
+Example: Orders & Payments within 10 minutes.
+
+Left Outer Join
+
+Always output from left stream; right side is included only if matched within time range.
+
+Useful: Orders stream (left) joined with Payments (right) → still show unpaid orders.
+
+Right Outer Join
+
+Opposite of left outer.
+
+Full Outer Join (⚠️ Not supported in all cases for stream-stream, because it can grow state unbounded).
+
+🔹 How Spark Handles It
+
+To make joins practical, Spark requires two things:
+
+Event-time column → e.g. order_time, payment_time.
+
+Watermarks → tell Spark “after X minutes, I don’t expect late data anymore, drop old state”.
+
+Example:
+
+orders = orders_stream.withWatermark("order_time", "10 minutes")
+payments = payments_stream.withWatermark("payment_time", "10 minutes")
+
+joined = orders.join(
+    payments,
+    expr("""
+        orders.order_id = payments.order_id
+        AND payments.payment_time BETWEEN orders.order_time AND orders.order_time + interval 10 minutes
+    """),
+    "inner"
+)
+
+🔹 What Happens Internally
+
+Spark buffers rows from both streams in state store (memory + disk).
+
+For each new row in one stream, Spark checks state store of the other stream for possible matches.
+
+Once watermarks pass, old rows are discarded to control memory.
+
+🔹 Example Use Cases
+
+Fraud detection → Join transactions stream with user location stream.
+
+Clickstream + Ads → Match ad impressions with user clicks within time window.
+
+IoT sensors → Join device telemetry with alerts in real time.
+
+🔹 Important Limitations
+
+Must define time constraints (watermarks + windows), otherwise join state grows forever.
+
+Output mode is usually append or update (not always complete).
+
+Late data (arriving after watermark) is dropped.
+
+✅ In short:
+
+Stream-Stream join = real-time correlation between two unbounded datasets.
+
+Needs event-time + watermark to bound state.
+
+Used in real-time analytics, fraud detection, monitoring, etc.
+
+
+1. The Problem Without Watermark
+
+In stream–stream joins, Spark would need to keep all past rows from both streams in memory/state to check for possible matches.
+
+Since streams are unbounded, state would grow forever → not possible.
+
+👉 Solution: We use watermarks + event-time windows to tell Spark when it is safe to drop old data from state.
+
+🔹 2. Watermark
+
+A watermark defines how long Spark should wait for late data before discarding state.
+
+Example:
+
+orders = orders_stream.withWatermark("order_time", "10 minutes")
+payments = payments_stream.withWatermark("payment_time", "10 minutes")
+
+
+Spark will keep each event for 10 minutes after its event-time.
+
+Any data arriving later than 10 minutes behind the current max event time is considered late → dropped.
+
+🔹 3. Windowing
+
+Sometimes you want to join events only if they occur within a time window (e.g., payment must occur within 15 minutes of the order).
+
+Example:
+
+joined = orders.join(
+    payments,
+    expr("""
+        orders.order_id = payments.order_id
+        AND payments.payment_time BETWEEN orders.order_time 
+                                      AND orders.order_time + interval 15 minutes
+    """),
+    "inner"
+)
+
+
+Here:
+
+order_time is the event-time column in orders.
+
+payment_time is the event-time column in payments.
+
+Spark will only consider matches that happen within this 15-minute interval.
+
+🔹 4. How Join Execution Works (Step by Step)
+
+Imagine:
+
+Orders stream (with watermark = 10 mins):
+
+T=12:00 → order_id=1  
+T=12:05 → order_id=2
+
+
+Payments stream (with watermark = 10 mins):
+
+T=12:06 → order_id=1  
+T=12:20 → order_id=2
+
+
+Join Logic (15-minute window):
+
+At 12:06, Spark finds payment for order_id=1 → MATCH ✅ (within 15 min).
+
+At 12:20, payment for order_id=2 arrives → still within 15 min of order 2 (12:05 → 12:20). ✅
+
+If payment for order_id=1 came at 12:30 → watermark would have expired order_id=1’s state, so it’s dropped ❌.
+
+🔹 5. Role of Watermark vs. Window
+
+Watermark → decides how long to keep old rows in state (controls memory growth).
+
+Window condition → decides which events are logically allowed to match.
+
+Both are required for stream–stream joins:
+
+Watermark = state management.
+
+Window = logical matching condition.
+
+🔹 6. Visualization
+Time →   12:00    12:05    12:10    12:15    12:20    12:25    12:30
+Orders → O1(12:00) O2(12:05)
+Payments→             P1(12:06)                   P2(12:20)
+
+Watermark: 10 mins
+Join window: 15 mins
+
+✔ O1(12:00) matches P1(12:06) 
+✔ O2(12:05) matches P2(12:20)
+✘ If P1 arrives at 12:30 → too late, watermark expired → no match
+
+🔹 7. Key Takeaways
+
+Stream–stream join needs event-time + watermark, otherwise state grows infinitely.
+
+Watermark = memory management (drops old state).
+
+Window = logical constraint (defines which records can match).
+
+Spark matches records as long as:
+
+They arrive before the watermark expires.
+
+They satisfy the join condition (including window).
+
+👉 In practice:
+
+If you want real-time matching (orders vs payments, clicks vs impressions), always use watermark + window.
+
+Without them, the job may fail due to unbounded state.
+
+
+f you do not define a watermark in a stream–stream join:
+1. No automatic default watermark
+
+Spark does not apply any default watermark.
+
+Without one, Spark assumes it must hold on to all past rows from both streams forever (since new late data could arrive at any time).
+
+2. What happens in execution
+
+The join’s state store (where Spark buffers unmatched rows) will keep growing unbounded.
+
+This leads to:
+
+Huge memory usage → job slows down.
+
+Disk spilling (state store writes to checkpoint location).
+
+Eventually → out-of-memory (OOM) error or job failure.
+
+3. Output correctness
+
+Technically Spark can still produce correct join results for a while.
+
+But since old state is never cleaned up, you risk:
+
+Extremely delayed outputs.
+
+Duplicate or unexpected matches (since very late data can still join with ancient state).
+
+Eventually job instability.
+
+4. Spark’s Behavior
+
+In stream–stream joins, Spark requires watermarks (since both sides are unbounded).
+
+If you forget to add .withWatermark() on both streams:
+
+Spark will fail with an AnalysisException telling you that watermarks are required.
+
+Example error:
+
+org.apache.spark.sql.AnalysisException:
+Stream-stream joins without watermarks are not supported because they can lead to unbounded state.
+
+🔹 Summary
+
+❌ No default watermark → Spark won’t assume one.
+
+⚠️ Without watermark in stream–stream joins → job fails early (AnalysisException).
+
+✅ You must define a watermark on both sides to bound the state and let Spark clean up old rows.
+
+👉 For stream–batch joins (one side static, one side streaming): watermark is optional.
+👉 For stream–stream joins: watermark is mandatory.
+
+Case 1: Watermark on Both Streams ✅
+orders   = orders_stream.withWatermark("order_time", "10 minutes")
+payments = payments_stream.withWatermark("payment_time", "10 minutes")
+
+
+Spark knows how long to retain old rows from both sides.
+
+After watermark passes, state for old events is dropped.
+
+Join executes safely with bounded state.
+
+🔹 Case 2: Watermark on Only One Stream ⚠️
+orders   = orders_stream.withWatermark("order_time", "10 minutes")
+payments = payments_stream   # ❌ no watermark
+
+What happens?
+
+Orders side → state is bounded, Spark will drop old rows after 10 min.
+
+Payments side → no watermark → Spark must keep all past rows forever, since a late order might still arrive and match them.
+
+Result:
+
+Join still runs (no immediate error).
+
+But state store for the non-watermarked stream grows unbounded → memory bloat, disk spills, eventual job crash.
+
+🔹 Why Spark Allows It?
+
+Spark requires at least one side of the join to have a watermark for cleanup.
+
+But for correctness, both sides should have watermarks, otherwise you risk unbounded state growth from the unbounded side.
+
+🔹 Example
+
+Suppose:
+
+Orders (watermarked at 10 mins):
+
+T=12:00 → order_id=1
+
+
+Payments (no watermark):
+
+T=12:00 → payment_id=1
+T=12:30 → payment_id=2
+T=13:00 → payment_id=3
+...
+
+
+Payments keep accumulating in state forever, because Spark doesn’t know when it’s safe to drop them.
+
+Even if order_id=1’s state is dropped after 12:10 (due to watermark), payments from 12:30, 13:00, … remain.
+
+Over time → state store explodes.
+
+🔹 Case 3: No Watermark on Either Side ❌
+
+Spark will fail fast:
+
+org.apache.spark.sql.AnalysisException:
+Stream-stream joins without watermarks are not supported because they can lead to unbounded state.
+
+
+✅ Best Practice: Always define watermarks on both streams in a stream–stream join.
+
+If you’re absolutely sure one side will never be late (e.g., Kafka topic with guaranteed ordering + arrival), you could skip watermarking that side — but it’s risky.
+
+
+✅ Pros of Stream–Stream Joins
+
+Dynamic correlation of live streams
+
+You can correlate two continuous event feeds in real-time.
+
+Example: orders stream with payments stream → detect matched orders.
+
+No need for preloading static reference data
+
+Works even when both sides are unbounded (Kafka, EventHub, Autoloader).
+
+Supports event-time logic
+
+By using watermarks + windows, you can join only events within a certain time bound.
+
+Example: join payments within 1 hour of order.
+
+Flexible join types
+
+Inner, left outer, right outer, full outer.
+
+Useful for scenarios like fraud detection, anomaly detection, SLA checks.
+
+🔹 ❌ Cons of Stream–Stream Joins
+
+Complexity
+
+Must handle event-time, lateness, watermarks.
+
+Without watermarks → job fails or grows unbounded.
+
+State explosion
+
+Spark has to keep both sides’ unmatched records in state store until watermark expires.
+
+If watermarks are too large (e.g., 24h), state can blow up → memory/disk overhead.
+
+Late data challenges
+
+If data arrives later than watermark → dropped (or cause duplicates if not carefully handled).
+
+Hard to guarantee correctness if sources are very late.
+
+Operational tuning required
+
+Need to tune spark.sql.shuffle.partitions, stateStore.maintenanceInterval, checkpointing, etc.
+
+Otherwise, performance degrades fast.
+
+🔹 ⚡ Performance Characteristics
+
+State Store Growth
+
+Both sides of join keep accumulating unmatched rows until watermark passes.
+
+Memory/disk grows proportional to input rate × watermark duration.
+
+Example: 1000 events/sec × 10min watermark → ~600K events in state.
+
+Watermark Effect
+
+Narrow watermark (e.g., 5 mins) → smaller state, faster, but more late data dropped.
+
+Wide watermark (e.g., 1 day) → large state, slower, but captures more late matches.
+
+Join Selectivity
+
+High match rate → less state (because records clear quickly after joining).
+
+Low match rate → state grows (many unmatched records waiting).
+
+Cluster Resources
+
+Stream–stream joins need larger memory/executor storage compared to stream–static.
+
+Scale out with autoscaling + Delta caching if needed.
+
+🔹 ✅ When to Use
+
+Two live event feeds that must be correlated
+
+Orders + Payments → detect completed transactions.
+
+Clickstream + Ads → attribute user clicks to ads seen.
+
+Fraud detection / monitoring
+
+Unusual login + unusual transaction in short time.
+
+Real-time SLAs
+
+Join “request” vs “response” streams to check response time windows.
+
+🔹 ❌ When Not to Use
+
+One side is truly static (lookup table) → use stream–static join instead (simpler, faster).
+
+Reference dataset changes slowly (daily batch) → pre-enrich data instead of streaming join.
+
+Data arrives very late / unbounded delays → watermark handling gets tricky, state grows unbounded.
+
+Large scale dimension enrichment (like joining with billions of product records) → better solved by precomputed Delta lookups or stream–batch design.
+
+🔹 Example
+orders   = (spark.readStream.format("delta")
+             .load("/mnt/orders")
+             .withWatermark("order_time", "10 minutes"))
+
+payments = (spark.readStream.format("delta")
+             .load("/mnt/payments")
+             .withWatermark("payment_time", "10 minutes"))
+
+joined = orders.join(
+    payments,
+    expr("""
+      orders.order_id = payments.order_id AND
+      payments.payment_time BETWEEN orders.order_time AND orders.order_time + interval 10 minutes
+    """),
+    "inner"
+)
+
+query = (joined.writeStream
+         .format("delta")
+         .option("checkpointLocation", "/mnt/chk")
+         .start("/mnt/output"))
+
+
+Orders and payments matched within 10 minutes are joined.
+
+If a payment arrives after 10 minutes → it won’t join.
+
+Spark drops expired rows from state after watermark, keeping state bounded.
+
+
+-----------------------------------------------------------Extra Info Ended
+def process_customers_orders():
+    orders_df = spark.readStream.table("orders_silver")
+    
+    cdf_customers_df = (spark.readStream
+                             .option("readChangeData", True)
+                             .option("startingVersion", 2)
+                             .table("customers_silver")
+                       )
+
+    query = (orders_df
+                .join(cdf_customers_df, ["customer_id"], "inner")
+                .writeStream
+                    .foreachBatch(batch_upsert)
+                    .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/customers_orders")
+                    .trigger(availableNow=True)
+                    .start()
+            )
+    
+    query.awaitTermination()
+    
+process_customers_orders()
+
+
+Here we are performing a join operation between two streaming tables.
+
+We start by reading the orders table as a streaming source, and reading the customers data as a streaming source as well.
+
+Then, we are performing inner join between these two data frames based on the customer_id key.
+When performing stream-stream join.
+
+Spark buffers past input as streaming state for both input streams, so that it can match every future
+input with past inputs and accordingly generate the joined results.
+
+And of course, similar to streaming duplication we saw before, we can limit the state using watermarks.
+
+Let us now run this to process the records using our foreachBatch logic.
+Indeed, new updates have been propagated from the bronze table and merged into our new silver table
+
+17. Stream-Static Joins -----------------------------------------------------------
+
+-----------------------------------------------------------Extra Info
+🔹 What is a Stream–Static Join?
+
+A stream–static join means you join an unbounded streaming dataset with a bounded static dataset.
+
+Streaming side = input events arriving continuously (e.g., Kafka, EventHub, Autoloader).
+
+Static side = fixed reference data (e.g., a lookup table in Delta, JDBC table, broadcast dimension).
+
+👉 Example use case:
+
+Streaming events (user clicks, orders, transactions).
+
+Join with a static dimension table (user profiles, product catalog, region codes) to enrich the stream.
+
+🔹 How it Works in Databricks
+
+When you run:
+
+streaming_df = spark.readStream.format("delta").load("/mnt/events")
+static_df    = spark.read.format("delta").load("/mnt/products")
+
+enriched = streaming_df.join(
+    static_df,
+    streaming_df.product_id == static_df.product_id,
+    "left"
+)
+
+query = (enriched
+          .writeStream
+          .format("delta")
+          .option("checkpointLocation", "/mnt/chk")
+          .start("/mnt/output"))
+
+
+Spark reads streaming events one micro-batch at a time.
+
+For each batch, it performs a normal DataFrame join against the static dataset.
+
+Since the static dataset is bounded, it doesn’t grow unbounded, so no watermark is needed.
+
+Spark may broadcast the static side if it fits in memory (efficient lookup).
+
+🔹 Types of Stream–Static Joins
+
+Inner join
+
+Keep only matches.
+
+Example: Orders joined with valid products.
+
+Left/Right outer join
+
+Keep all streaming records even if no match in static.
+
+Example: Orders where product_id might be missing in catalog → still keep the order.
+
+Left semi / anti join
+
+Filter streaming records based on existence in static.
+
+Example: Drop events where user_id not in active_users table.
+
+🔹 Key Properties
+
+✅ No watermark needed → because the static dataset is bounded (state does not grow).
+
+✅ Efficient → static side can be broadcast across executors.
+
+❌ Static side is fixed → unless you explicitly reload the static dataset, it does not reflect changes made after the query starts.
+
+🔹 Example Use Cases
+
+Enrichment
+
+Add region, category, or customer name to streaming transactions.
+
+Filtering
+
+Only process events for users in a whitelist (loaded from static table).
+
+Validation
+
+Discard or flag records that don’t exist in a static reference table.
+
+🔹 Difference from Stream–Stream Join
+Aspect	Stream–Static Join	Stream–Stream Join
+Static side state	Fixed, bounded	Both sides unbounded
+Watermark needed	❌ No	✅ Yes (both sides ideally)
+State growth	Bounded	Potentially unbounded
+Use case	Enrichment, filtering	Matching two event streams
+
+✅ In short:
+A stream–static join in Databricks lets you enrich/filter streaming data with a bounded lookup table efficiently. 
+It avoids the complexity of watermarks and unbounded state.
+
+
+✅ Pros of Stream–Static Joins
+
+Simplicity
+
+Very easy to implement: just join your stream with a static DataFrame.
+
+No need to manage watermarks, windows, or late events.
+
+No unbounded state
+
+Since the static dataset is bounded, Spark doesn’t need to keep growing state.
+
+Memory usage stays stable → very reliable.
+
+Performance (Broadcast Joins)
+
+If the static dataset is small (e.g., product catalog, country codes), Spark can broadcast it to executors.
+
+Lookup becomes very fast (hash lookup per record).
+
+Good for enrichment / filtering
+
+Perfect for adding attributes (name, category, region) to streaming events.
+
+Or for dropping invalid records (e.g., user not in whitelist).
+
+🔹 ❌ Cons of Stream–Static Joins
+
+Static data is fixed
+
+By default, the static DataFrame is loaded once at query start.
+
+If your reference data (e.g., product catalog) changes daily, the join won’t see updates unless you restart the streaming query.
+
+Large static datasets
+
+If static dataset is too big (e.g., 1B rows), Spark cannot broadcast it.
+
+Then the join becomes a shuffle join for every micro-batch, which is expensive.
+
+Operational complexity for refresh
+
+If you want the static data to stay fresh (say, updated hourly), you must reload it periodically.
+
+This usually requires restarting the stream or using Delta time travel/versioning tricks.
+
+Not suitable for event-time correlation
+
+Stream–static joins are not good if you want to join two time-based event streams (e.g., orders with payments).
+
+That requires stream–stream joins with watermarks, not stream–static.
+
+🔹 ⚡ Performance Characteristics
+
+Broadcast Join (best case)
+
+If static dataset < ~10–20 GB and fits in memory, Spark auto-broadcasts it.
+
+Join cost is almost negligible per micro-batch → scales well.
+
+Shuffle Join (worst case)
+
+If static dataset is very large, Spark must repartition both sides.
+
+Every micro-batch pays the cost of shuffling the streaming records.
+
+Latency goes up significantly.
+
+Caching static side
+
+You can .cache() or .persist() the static dataset if it’s reused across multiple queries.
+
+Helps avoid re-reading large tables.
+
+🔹 ✅ When to Use
+
+Enrichment with small/medium lookup tables (product catalog, reference codes, country list, active users).
+
+Filtering streaming data (e.g., drop events where user not in valid_customers table).
+
+Validation / rules checking against static metadata.
+
+When the static dataset changes slowly (daily/weekly).
+
+🔹 ❌ When Not to Use
+
+Reference dataset changes frequently (minutes/hours) → you’d need a restart to refresh it. Instead, consider stream–stream join if both are unbounded.
+
+Static dataset is huge (>100 GB) and doesn’t fit in memory → shuffle join becomes a bottleneck.
+
+Need historical correctness → stream–static join won’t handle CDC-type changes in reference data.
+
+🔹 Alternatives / Patterns
+
+If static dataset updates frequently
+
+Turn it into another stream (via Delta CDC, Kafka, etc.) → use stream–stream join.
+
+If static dataset is large but changes slowly
+
+Use Delta table and reload periodically via .load() inside a structured streaming query refresh.
+
+If static dataset is too big for broadcast
+
+Precompute necessary joins in a batch layer (Silver/Gold tables).
+
+Or use dimension tables with surrogate keys to shrink join size.
+
+🔹 Real Example
+
+Stream: Customer transactions (cust_id, amount, txn_time).
+
+Static: Customer dimension (cust_id, name, segment).
+
+Join → Enrich transactions with customer segment.
+
+✅ Good: If dimension table is 1M rows (fits in memory), you can broadcast it.
+❌ Bad: If dimension table is 1B rows and updated every hour, stream–static join will be slow + stale. Better → treat dimension updates as another stream.
+
+⚡ Summary
+
+Stream–static joins = great for lookup enrichment and filtering with small/medium, slow-changing reference tables.
+
+They are fast, safe, and simple because no watermark is needed.
+
+Not good for frequently changing or very large reference data — in those cases, convert to a stream and do a stream–stream join instead.
+
+-----------------------------------------------------------Extra Info Ended
+
+In Spark Structured Streaming, Incremental tables or streaming tables are append-only data sources.
+So data can only be appended in these tables.
+
+While static tables typically contain data that may be updated, deleted or overwritten
+
+So such data sources are not streamable because they break the above append-only requirements of streaming sources.
+
+
+>> To better understand how stream-static join works, here is an illustration showing a streaming table. 
+
+Students.
+id	|	name 	|	course_id
+1		Adam		C01
+
+And a static table Courses.
+course_id	 |	course_name
+C01				Math
+
+
+When performing stream-static join, the resulting table is an incremental table.
+
+Here we see the result of performing inner join between students and courses based on the course ID.
+
+Resultant Table
+id	|	name 	|	course_id	|	course_name
+1		Adam		C01				Math
+
+
+This pattern will take advantage of Delta Lake's guarantee that the latest version of the static Delta table is returned each time it is queried.
+
+Imp: In stream-static join, the streaming portion of the join drives the join process.
+Only new data appearing on the streaming side of the join will trigger the processing.
+
+Imp: While adding new records into the static table, will not automatically trigger updates to the result of the stream-static join.
+So, nothing will happen in this case.
+
+Students.
+id	|	name 	|	course_id
+1		Adam		C01
+2		John		C01
+3		Sarah 		C02
+
+And a static table Courses.
+course_id	 |	course_name
+C01				Math
+C02				Biology
+
+Resultant Table
+id	|	name 	|	course_id	|	course_name
+1		Adam		C01				Math
+2		John		C01				Math
+
+Note : In a stream-static joins only matched records at the time the stream is processed will be presented in the resulting table.
+This means unmatched records at the time the stream is processed like the record number 5 will be
+missed from the resulting table.
+
+
+Students.
+id	|	name 	|	course_id
+1		Adam		C01
+2		John		C01
+3		Sarah 		C02
+4		Emma		C02
+5		Sophia		C03
+
+And a static table Courses.
+course_id	 |	course_name
+C01				Math
+C02				Biology
+
+Resultant Table
+id	|	name 	|	course_id	|	course_name
+1		Adam		C01				Math
+2		John		C01				Math
+4		Emma		C02				Biology
+
+
+Note:- But the question now, can we buffer these unmatched records as a streaming state to be matched later? The answer is no.
+
+Streaming static joins are not stateful.
+Meaning that we cannot configure our query to wait for new records to appear in the static side,
+prior to calculating the results.
+
+So when leveraging streaming static joins, make sure to be aware of these limitations for unmatched records.
+For this, you can configure a separate batch job to find and insert these missed records.
+
+-----------------------------------------------------------Extra Info
+
+-----------------Stream Stream vs Stream Static Join-----------
+
+🔹 Summary Table (vs. Stream–Static)
+Aspect	Stream–Static Join	Stream–Stream Join
+Complexity	✅ Simple	❌ Complex (watermarks, state)
+State Growth	None (bounded)	Can be large, depends on watermark
+Performance	Fast (broadcast)	Slower, state + shuffle overhead
+Use Case	Enrichment/filter	Real-time correlation of two feeds
+Watermark Needed	❌ No	✅ Yes (both sides ideally)
+Handling Late Data	Not relevant	Must be tuned with watermark
+
+⚡ In short:
+
+Use stream–static for enrichment/filtering (fast, safe).
+
+Use stream–stream only when both datasets are truly unbounded event 
+feeds that need correlation in real-time — but be prepared for state management and tuning.
+
+-----------------------------------------------------------Extra Info Ended
+
+21. Stream-Static Joins (Hands - On)-----------------------------------------------------------
+
+def process_books_sales():
+    
+    orders_df = (spark.readStream.table("orders_silver")
+                        .withColumn("book", F.explode("books"))
+                )
+
+    books_df = spark.read.table("current_books")
+
+    query = (orders_df
+                  .join(books_df, orders_df.book.book_id == books_df.book_id, "inner")
+                  .writeStream
+                     .outputMode("append")
+                     .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/books_sales")
+                     .trigger(availableNow=True)
+                     .table("books_sales")
+    )
+
+    query.awaitTermination()
+    
+process_books_sales()
+
+Here, we read our orders table as a streaming source using spark.readStream while we read the current_books
+
+static table using spark.read
+
+Now, we can simply join the two data frames as usual.
+Lastly, we run a trigger available now batch to process the data and write a stream in append mode.
+
+Let us run this cell to create and run this function. Great.
+
+Let us now review the data written in our new table.
+
+Currently we have about 3554 records.
+
+Note:- Remember when performing a stream-static join, the streaming portion of the join drives this join process.
+So only new data appearing on the streaming side of the query will trigger the processing.
+
+Why so ?
+The dimension table is read once when the query starts.
+Spark keeps it in memory / broadcasts it for joins.
+✅ Very fast (no state needed).
+❌ If the dimension table changes in storage (new rows, updates), those changes will not be reflected until you restart the stream query.
+
+And we are guaranteed to get the latest version of the static table during each microbatch transaction.
+
+
+22. Materialized Gold Tables (Hands On)-----------------------------------------------------------
+
+-----------------------------------------------------------Extra Info
+What is a View?
+
+A view is just a stored query definition.
+
+When you query the view, the underlying SQL runs on the base tables each time.
+
+Example:
+
+CREATE VIEW active_users AS
+SELECT * FROM users WHERE status = 'ACTIVE';
+
+
+Every time you run SELECT * FROM active_users, Spark/SQL runs the query against users.
+
+✅ Always fresh.
+
+❌ No performance gain, since it’s recomputed.
+
+🔹 What is a Materialized View (MV)?
+
+A materialized view is a precomputed, stored result of a query.
+
+Think of it like a “cached table” that gets updated when base data changes (immediately or on refresh).
+
+Example:
+
+CREATE MATERIALIZED VIEW active_users_mv AS
+SELECT * FROM users WHERE status = 'ACTIVE';
+
+
+This physically stores the query result (like a table).
+
+Queries against it read directly from the stored data.
+
+🔹 Key Differences
+Aspect	View	Materialized View
+Storage	No (only query definition)	✅ Yes (stores data physically)
+Performance	❌ Always recomputed	✅ Faster (precomputed)
+Freshness	Always up-to-date	Might be stale (needs refresh/maintenance)
+Maintenance	None	Needs refresh (manual or automatic)
+Use Case	Abstraction layer	Query acceleration / caching
+🔹 Pros of Materialized Views
+
+✅ Faster queries → avoids recomputation, especially for expensive aggregations or joins.
+✅ Great for BI/analytics → dashboards query MV instead of raw tables.
+✅ Reduces resource usage → less repeated work.
+✅ Supports incremental refresh in many systems (only process changes).
+
+🔹 Cons of Materialized Views
+
+❌ Storage overhead → results are duplicated.
+❌ Staleness risk → data might not be fresh unless refreshed.
+❌ Maintenance cost → needs scheduling or automatic refresh rules.
+❌ Complex updates → if underlying tables change schema, MV may break.
+
+🔹 When to Use
+
+Expensive aggregations you need frequently (e.g., daily sales totals).
+
+Dashboard/reporting queries that hit the same complex joins repeatedly.
+
+Near-real-time analytics where slight staleness is acceptable.
+
+🔹 When Not to Use
+
+If the query is lightweight → a normal view is simpler.
+
+If you absolutely need real-time latest data → MV might be stale.
+
+If storage cost is a big concern → MVs duplicate data.
+
+🔹 Example in Databricks (Delta Live Tables / SQL)
+
+Databricks doesn’t have “materialized views” in the traditional RDBMS sense, but:
+
+You can simulate them by creating a Delta table with scheduled refresh.
+
+Or use Delta Live Tables (DLT) pipelines to keep derived tables always up-to-date.
+
+CREATE TABLE daily_sales AS
+SELECT date(order_time) as day, SUM(amount) as total
+FROM orders
+GROUP BY date(order_time);
+
+
+This is effectively a materialized view if you schedule it to refresh.
+
+⚡ In short:
+
+View = virtual query, always fresh, no storage benefit.
+
+Materialized View = precomputed result, faster, but needs refresh to stay up-to-date.
+
+-----------------------------------------------------------Extra Info Ended
+Imp:-
+Databricks uses a feature called Delta Caching.
+So subsequent execution of queries will use cached results.
+However, this result is not guaranteed to be persisted and is only cached for the currently active cluster.
+
+In a traditional databases, usually you can control cost associated with materializing results using materialized views.
+In Databricks, the concept of a materialized view most closely maps to that of a gold table.
+
+Gold tables help to cut down the potential cost and latency associated with complex ad-hoc queries.
+Let us now create the gold table presented earlier in our architecture diagram.
+
+This table Stores Summary statistic of sales per author.
+It calculates the orders count and the average quantity
+per author and per order_timestamp for each non-overlapping five minutes interval.
+
+Furthermore, similar to streaming deduplication, we automatically handle late, out-of-order data, and limit the state using watermarks.
+Here we define a watermark of ten minutes during which incremental state information is maintained for late arriving data.
+
+query = (spark.readStream
+                 .table("books_sales")
+                 .withWatermark("order_timestamp", "10 minutes")
+                 .groupBy(
+                     F.window("order_timestamp", "5 minutes").alias("time"),
+                     "author")
+                 .agg(
+                     F.count("order_id").alias("orders_count"),
+                     F.avg("quantity").alias ("avg_quantity"))
+              .writeStream
+                 .option("checkpointLocation", f"dbfs:/mnt/demo_pro/checkpoints/authors_stats")
+                 .trigger(availableNow=True)
+                 .table("authors_stats")
+            )
+
+query.awaitTermination()
+
+
+SECTION 4: Improving Performance-------------------------------------------------------------
+
+23.  Partitioning Delta Lake Tables-----------------------------------------------------------
+
+-----------------------------------------------------------Extra Info
+
+🔹 1. What is Partitioning?
+
+Partitioning means organizing data into subfolders (partitions) based on the values of specific columns.
+
+Example: Delta table partitioned by year and month →
+
+/mnt/delta/sales/
+  ├── year=2023/month=01/part-0001.snappy.parquet
+  ├── year=2023/month=02/part-0002.snappy.parquet
+  ├── year=2024/month=01/part-0003.snappy.parquet
+
+
+Each partition directory contains a subset of data.
+
+Spark uses these folders for partition pruning (skip reading irrelevant partitions).
+
+🔹 2. Benefits of Partitioning
+
+✅ Query Performance (Partition Pruning)
+
+Queries with filters like WHERE year=2024 AND month=01 → Spark reads only relevant folders.
+
+Avoids full table scans.
+
+✅ Scalability for Large Datasets
+
+Breaks down big data into manageable chunks.
+
+Helps parallelism (each partition can be processed independently).
+
+✅ Efficient Incremental Loads
+
+Easy to overwrite just one partition (e.g., reload “yesterday’s data”).
+
+Faster ingestion pipelines.
+
+✅ Cost Reduction
+
+In Databricks + cloud storage, skipping partitions reduces I/O and compute.
+
+🔹 3. Downsides of Partitioning
+
+❌ Too Many Partitions (Over-partitioning)
+
+If you partition on high-cardinality columns (like user_id), you’ll end up with millions of tiny files/dirs.
+
+This causes “small file problem” → bad performance.
+
+❌ Too Few Partitions (Under-partitioning)
+
+If you partition only by year, each partition may still be huge (e.g., all 2024 sales).
+
+Queries like WHERE month=02 still scan too much data.
+
+❌ Write Overhead
+
+Partitioning introduces extra directory management.
+
+Updates/deletes can touch multiple partitions.
+
+🔹 4. Best Practices in Databricks
+✅ Good Partition Columns
+
+Columns that are frequently used in filters.
+
+Columns with moderate cardinality (not too high, not too low).
+
+Example: year, month, region, business_unit.
+
+❌ Bad Partition Columns
+
+High-cardinality columns (customer_id, transaction_id).
+
+Columns with constantly changing values (like timestamps down to seconds).
+
+📌 Example
+CREATE TABLE sales_delta (
+  order_id STRING,
+  amount DECIMAL(10,2),
+  region STRING,
+  order_date DATE
+)
+USING DELTA
+PARTITIONED BY (region, year(order_date), month(order_date));
+
+
+Here, queries filtering by region or date will be much faster.
+
+🔹 5. Partition Pruning in Action
+
+If your table is partitioned by (region, year, month), a query like:
+
+SELECT SUM(amount)
+FROM sales_delta
+WHERE region = 'APAC' AND year = 2024 AND month = 01;
+
+
+👉 Spark scans only the region=APAC/year=2024/month=01 folder instead of the whole dataset.
+
+🔹 6. Alternatives/Complements to Partitioning
+
+Z-Ordering (Delta specific)
+
+Databricks feature to cluster data within partitions.
+
+Good for high-cardinality fields (like customer_id) where partitioning would explode.
+
+OPTIMIZE sales_delta
+ZORDER BY (customer_id);
+
+
+Bloom Filters (Delta 2.0+)
+
+Indexing technique to speed up lookups for specific values.
+
+CREATE BLOOMFILTER INDEX ON TABLE sales_delta FOR COLUMNS(customer_id) OPTIONS ('fpp'='0.01');
+
+
+Auto-Optimize
+
+Databricks can automatically compact small files and optimize partitions.
+
+🔹 7. Summary
+
+Partitioning = directory-based data skipping.
+
+✅ Great for large tables with predictable filter patterns (date, region).
+
+❌ Avoid high-cardinality columns (over-partitioning).
+
+Use Z-ORDER + Bloom filters to complement partitioning for tricky columns.
+
+Tune based on query patterns + ingestion patterns.
+
+
+
+-----------------------------------------------------------Extra Info Ended
+
+
+
+Partitioning is a strategy for optimizing query performance on large data tables.
+
+A partition is composed of a subset of rows in a table that share the same value for a predefined subset of columns called the partitioning columns.
+
+In this example, we partition our table by the year column, which has three unique values.
+So we end up by having three partitions for the table.
+
+id 	name	month 	year  Partiion
+1 	Adom 	9 		2015
+2 	Sarah 	11		2015
+3 	John 	5		2000
+4 	Adam 	9 		2000
+5 	Emme 	10 		2000
+6 	Eric 	1 		2023
+7 	sophia 	3 		2023
+
+
+To use partitioning, you define the set of partitioning columns when you create the table
+by including the PARTITION BY clause.
+
+CREATE TABLE my_table (id INT, name STRING, year INT, month INT)
+PARTITIONED BY (year)
+
+When inserting rows in the table Databricks automatically create a data directory for each partition
+and dispatches rows into the appropriate directory.
+
+Using partitions can speed up the queries against the table as well as data manipulation.
+When running a query that filters data on a partitioning column
+partitions not matching the conditional statement will be skipped entirely.
+
+Partition Skipping
+SELECT * FROM my_table
+Where year =2023
+
+
+Note:- Delta Lake also has several operations like OPTIMIZE commands that can be applied at the partition level
+And of course, you can partition your table by more than one column.
+
+
+And of course, you can partition your table by more than one column.
+Here we are partitioning by the year and month columns.
+
+CREATE TABLE my_table (id INT, name STRING, year INT, month INT)
+PARTITIONED BY (year, month)
+
+IMP:- When choosing partitioning columns, it is good to consider the following:
+
+Choosing partition columns---------------
+1. Total values present in a column
+» Low cardinality fields should be used for partitioning
+
+2. Total records share a given value for a column
+» Partitions should be at least 1 GB in size
+
+3. Records with a given value will continue to arrive indefinitely
+» Datetime fields can be used for partitioning |
+
+🔹 ✅ Summary / Rules of Thumb
+Rule				Guidance														Example
+Low cardinality		Only partition on columns with small/moderate unique values		region, country, category
+Partition size		Each partition ≥1 GB to avoid small file problem				month/year for large tables
+Continuous arrival	Use columns that are append-only								order_date, event_timestamp
+
+
+Imp:- Avoid Over-Partitioning
+» Files cannot be combined or compacted across partition boundaries
+Partitioned small tables increase storage costs and total number of files to scan.
+
+» If most partitions < 1GB of data, the table is over-partitioned
+
+»Data that is over-partitioned or incorrectly partitioned will suffer greatly
+> Lead to slowdowns for most general queries
+> Require a full rewrite of all data files to remedy	
+
+
+IMP:- Partitioning is also useful when removing data older than a certain age from the table.
+
+For example, you can decide to delete the previous year's data.
+In this case, file deletion will be cleanly along partition boundaries.
+
+In the same way, data could be archived or backed up at partition boundaries to a cheaper storage tier.
+This drives a huge savings on a cloud storage.
+
+Note:- 
+Very Imp :- 
+But if you are using this table as a streaming source, remember that deleting data breaks the
+append-only requirement of streaming sources, which makes the table no more Streamable.
+
+To avoid this, you need to use the ignoreDeletes option when streaming from this table.
+This option enables the streaming processing from Delta tables with partition deletes.
+
+-----------------------------------------------------------Extra Info
+
+this is an important nuance in Databricks Delta + Structured Streaming. Let’s break it down carefully.
+
+🔹 1. Streaming from a Delta Table
+
+When you read a Delta table as a streaming source, Spark expects the source to be append-only:
+
+df = spark.readStream.format("delta").load("/mnt/delta/my_table")
+
+
+Spark continuously reads newly added rows.
+
+It tracks what has already been processed using the Delta transaction log and checkpoints.
+
+✅ This works smoothly as long as the table is append-only (no updates/deletes to already written data).
+
+🔹 2. Why deletes break streaming
+
+If you perform a delete or update on a Delta table that is being read as a streaming source:
+
+DELETE FROM my_table WHERE region = 'APAC';
+
+
+Delta records this in the transaction log.
+
+Streaming queries, by default, cannot handle deleted rows because:
+
+They expect the log to only grow with new rows.
+
+Deletes make the history “non-linear” (Spark can’t replay the log as a simple append).
+
+❌ Result: The table becomes non-streamable — streaming queries may fail or behave incorrectly.
+
+🔹 3. Using ignoreDeletes option
+
+Delta provides an option to ignore deletes while reading as a stream:
+
+df = (spark.readStream
+      .format("delta")
+      .option("ignoreDeletes", "true")
+      .load("/mnt/delta/my_table"))
+
+
+What it does:
+
+Spark ignores any delete markers in the Delta log.
+
+Only new added rows are considered for the stream.
+
+This keeps the table effectively append-only for streaming purposes.
+
+Useful when you still want to stream data, even though someone occasionally deletes old partitions/rows.
+
+🔹 4. When to use ignoreDeletes
+
+✅ Use it when:
+
+You have a Delta table with periodic deletes, but you don’t need those deletes to propagate downstream.
+
+You are doing streaming analytics or ETL and just care about new rows arriving.
+
+❌ Do not use it when:
+
+You need correctness for updates/deletes downstream.
+
+You need exactly the current state — in that case, use Delta CDC or batch processing.
+
+🔹 5. Example Scenario
+-- Delta table initially
++---------+-------+
+| order_id| amount|
++---------+-------+
+| 101     | 500   |
+| 102     | 300   |
++---------+-------+
+
+-- Streaming query
+df = spark.readStream.format("delta").option("ignoreDeletes","true").load("/mnt/delta/orders")
+
+
+Later someone deletes a row:
+
+DELETE FROM orders WHERE order_id = 101;
+
+
+Without ignoreDeletes → stream may fail or stop.
+
+With ignoreDeletes → stream continues, row 101 is ignored, only new inserts (like order_id=103) are picked up.
+
+🔹 ✅ Key Takeaways
+
+Streaming from Delta tables requires append-only data.
+
+Deletes/updates break the append-only assumption.
+
+Use ignoreDeletes=true to ignore deletes and keep streaming.
+
+Use Delta CDC if you need to propagate deletes/updates correctly.
+
+-----------------------------------------------------------Extra Info Ended
+
+And of course, the deletion of files will not actually occur until you run VACUUM command on the table.
+
+To avoid this, you need to use the ignoreDeletes option when streaming from this table.
+
+
+25. Optimizing Data File Layout----------------------------------------------------------
+
+Learning Objectives
+» The concept of data file layout
+» Exploring optimization techniques.
+
+The data file layout in Databricks refers to the organization and storage structure of the underlying data files that make up a delta table.
+
+Optimizing these layouts enable leveraging data skipping algorithms, which ensure that only relevant
+data files are read when executing queries.
+
+So, by skipping a large number of unnecessary files, this method will significantly reduce both time
+and computational resources.
+
+Optimization techniques:
+1- Partitioning
+Partitioning can improve the performance, but only for huge delta tables.
+Small to medium size tables will not benefit from partitioning because, as we saw, partitioning
+physically separates data files into subfolders.
+
+Imp: So, OPTIMIZE commands will only be applied at the partition level to compact data files, which leave
+us with a small file problem in the table.
+
+Partitioning Limitations-----
+» Prevents file compaction across partition boundaries
+» Results in a small files problem
+
+» Inefficient for high-cardinality columns
+» Results in a small files problem
+
+» Static: Re-prartitioning requires a full table rewrite
+
+2- Z-Order Indexing
+Z-order indexing groups your data into optimized files without creating subfolders.
+
+Z-order indexing, in Delta Lake is about co-locating and reorganizing column information in the same set of files.
+
+This can be done by adding the ZORDER BY keyword to the OPTIMIZE command, followed by one or more column name.
+» Group similar data into optimized files without creating directories
+
+» OPTIMIZE my_table
+ZORDER BY column_name
+
+»Leverage data-skipping algorithms
+Z-order indexing is used by data skipping algorithms to extremely reduce the amount of data that need to be read.
+
+»Effective for High-cardinality columns
+
+Z-order Indexing Limitations----
+The main issue with Z-order indexing is that it is not an incremental operation.
+
+When a new data is ingested, you must rerun the OPTIMIZE command to reorganize the data.
+Rerunning this command may result in the recreation of all files in the entire table, which can be computationally intensive.
+
+
+3- Liquid Clustering---
+Liquid clustering is an improved version of Z-order indexing that provides more flexibility and better performance.
+
+Like partitioning, liquid clustering is defined at the table level by specifying your clustering keys.
+This eliminates the need to specify them at each run of the optimize command.
+
+You can enable liquidity clustering on a new or existing tables using the CLUSTER BY clause, followed
+by the clustering columns.
+
+Table-level definition
+» New fables:
+CREATE TABLE tablel(coll, INT, col2 STRING, col3 DATE)
+CLUSTER BY (coll, col3)
+
+» Existing fables:
+ALTER TABLE table2
+CLUSTER BY (<clustering columns>)
+
+IMP: Clustering is not compatible with partitioning or ZORDER
+
+Note:- You can create a new table by projecting the existing table and using the previous partition columns
+and Z-order columns as clustering keys.
+
+To trigger clustering,
+
+simply use the OPTIMIZE command on your table.
+
+This is an incremental operation. On a new data ingestion,
+It is smart enough to know that old data is already well clustered.
+
+So, on the next run of the OPTIMIZE command, only unoptimized files are affected, while files already optimized are simply ignored.
+
+As a result, optimize operations for clustered tables run quickly and efficiently.
+
+Moreover, liquid clustering provides the flexibility to redefine clustering keys without rewriting existing data.
+
+So, you can evolve your data layout alongside your business needs over time.
+
+Choosing Clustering Keys-----------
+» Flexible to redefine clustering keys without rewriting existing data
+» Choose clustering keys based on your query pattern
+
+The optimal way is to choose them based on your query pattern, specifically those that are frequently used in query filters.
+
+However, such an insight may not be available during the creation of new tables.
+
+To address this challenge, you can use Automatic Liquid Clustering. 
+With Automatic Liquid Clustering, Databricks automatically chooses clustering keys by analyzing the table historical query workloads.
+
+This requires activating a feature called predictive optimization on Unity Catalog managed tables.
+
+Syntax
+» New tables:
+CREATE TABLE tablel(coll, INT, col2 STRING, col3 DATE)
+CLUSTER BY AUTO
+
+» Existing tables:
+ALTER TABLE table2
+CLUSTER BY AUTO
+
+-----------------------------------------------------------Extra Info
+
+🔹 1. What is Liquid Clustering?
+
+Liquid Clustering is an automated, maintenance-free clustering mechanism for Delta tables.
+
+Delta Lake organizes data into physical files (Parquet), and clustering helps to colocate related data in the same file for efficient reads.
+
+Liquid Clustering is adaptive — it automatically reorganizes data in the background to optimize query performance.
+
+Think of it as self-optimizing Z-Ordering.
+
+🔹 2. How it Works
+
+You define clustering columns on a Delta table:
+
+ALTER TABLE sales
+SET TBLPROPERTIES (
+  delta.liquidClustered = 'true',
+  delta.liquidClusteredColumns = 'customer_id, region'
+)
+
+
+Delta tracks the column distribution and file sizes.
+
+When new data arrives, Delta automatically moves/rewrites files to maintain clustering.
+
+Unlike manual OPTIMIZE with Z-Ordering:
+
+No manual scheduling required.
+
+Automatically balances small files and clustered layout.
+
+Reduces query scan time significantly.
+
+🔹 3. Benefits of Liquid Clustering
+
+✅ Automatic Optimization
+
+No need to run OPTIMIZE … ZORDER BY manually.
+
+✅ Better Query Performance
+
+Queries with filters on clustering columns are much faster due to colocated data.
+
+✅ Reduced Small File Problem
+
+Automatically merges small files while maintaining clustering.
+
+✅ Near Real-Time Clustering
+
+Works even with streaming writes.
+
+🔹 4. When to Use
+
+Large Delta tables where query patterns are predictable (e.g., filters on customer_id, region, order_date).
+
+Tables with streaming or batch inserts that would otherwise create small files or unclustered layouts.
+
+Use when you want maintenance-free performance improvements compared to manual clustering.
+
+🔹 5. When Not to Use
+
+Very small tables → clustering overhead may outweigh benefit.
+
+Tables where query patterns are completely ad-hoc → clustering may not help.
+
+You need full control over clustering / file layout → manual OPTIMIZE/Z-Order might be better.
+
+🔹 6. Comparison: Manual Z-Ordering vs Liquid Clustering
+Feature	Manual Z-Order	Liquid Clustering
+Trigger	Manual OPTIMIZE	Automatic on writes
+Maintenance	Needs scheduling	Self-maintained
+Streaming support	Needs manual handling	Automatic
+Small file handling	Optional merge	Automatic
+Ease of use	Medium	High
+
+🔹 7. Key Points
+
+Liquid Clustering is Delta-specific.
+
+It’s designed to simplify large-scale table maintenance.
+
+Works with both batch and streaming pipelines.
+
+
+
+When to use or not use partitioning /z order/ liquid clustering ?? -------
+Can all three be applied at once on a table ??------
+
+🔹 1. Partitioning
+
+When to use:
+
+Low- to moderate-cardinality columns.
+
+Examples: year, month, region, country.
+
+Columns frequently used in query filters.
+
+Append-heavy tables with time-based or categorical filters.
+
+When NOT to use:
+
+High-cardinality columns (like customer_id, order_id).
+
+Columns that continuously change per row (too many tiny partitions → small file problem).
+
+Goal: Reduce I/O by skipping irrelevant partitions.
+
+🔹 2. Z-Ordering (Manual Clustering)
+
+When to use:
+
+High-cardinality columns that are frequently filtered but cannot be partitioned.
+
+Examples: customer_id, product_id.
+
+Tables where query performance is limited by file scanning inside partitions.
+
+When NOT to use:
+
+Small tables (benefit is minimal).
+
+Queries with completely ad-hoc filter patterns (Z-Order only helps for columns you optimize).
+
+Goal: Reduce scan size within partitions (colocate relevant rows in the same file).
+
+🔹 3. Liquid Clustering (Automatic Clustering)
+
+When to use:
+
+Large Delta tables (batch or streaming).
+
+Tables with frequent inserts / small files.
+
+You want maintenance-free clustering without running OPTIMIZE manually.
+
+When NOT to use:
+
+Very small tables (clustering overhead > benefit).
+
+Tables with unpredictable query patterns (no predictable columns to cluster).
+
+Goal: Automatically maintain clustered layout for efficient reads and small file management.
+
+🔹 Can All Three Be Applied at Once?
+
+Yes — all three can be applied, but with some rules:
+
+Feature	How It Works	Can be Combined?	Notes
+Partitioning	Physically separates data into folders	✅ Yes	Choose low-cardinality column(s)
+Z-Ordering	Reorganizes data inside partitions	✅ Yes	Best for high-cardinality filter columns
+Liquid Clustering	Automatic background clustering	✅ Yes	Can cluster on columns already partitioned / Z-Ordered
+
+Typical combinations:
+
+Partition + Z-Order
+
+Partition by low-cardinality column (year), Z-Order by high-cardinality column (customer_id).
+
+Common for time-series tables with frequent filters on ID.
+
+Partition + Liquid Clustering
+
+Partition by month, Liquid Cluster by customer_id, region.
+
+Let Databricks handle small files + clustering automatically.
+
+Z-Order + Liquid Clustering
+
+If table is not partitioned but very large, you can use Liquid Clustering on same columns you would manually Z-Order.
+
+Spark automatically optimizes layout.
+
+All Three Together
+
+Partition by year/month.
+
+Z-Order by customer_id.
+
+Liquid Clustering manages future inserts and small files.
+
+✅ This is ideal for large Delta tables with both partitioned filtering and high-cardinality filters.
+
+🔹 Key Guidelines
+
+Partitioning = pruning/filtering at folder level → coarse-grained.
+
+Z-Ordering = data colocation inside partitions → fine-grained.
+
+Liquid Clustering = automatic file reorganization → background optimization.
+
+Choose columns carefully to avoid over-partitioning or unnecessary Z-Ordering.
+
+Batch vs streaming: Partitioning is critical for streaming incremental loads; Z-Ordering/Liquid Clustering improves query performance.
+
+
+Note:- 
+Databricks recommends either use manual Z-Order OR Liquid Clustering, not both on the same table/columns.
+Reason: Liquid Clustering manages file layout automatically; manual Z-Order can conflict or be overwritten.
+
+-----------------------------------------------------------Extra Info Ended
+
+
+26. Delta Lake Transaction Log----------------------------------------------------------
+
+We know that each commit to the table is written as a JSON file in the delta log subdirectory.
+
+The JSON file contains the list of actions performed, like adding or removing data files from the table.
+So in order to resolve the current state of the table, Spark needs to process many tiny, inefficient JSON files.
+
+Imp:- To avoid this issue, Databricks automatically creates
+
+Parquet checkpoint files every ten commits.
+This accelerates the resolution of the current table state.
+
+These checkpoint files, save the entire state of the table at a point in time in native parquet format
+that is a quick and easy for Spark to read.
+
+So rather than processing all the intermediate JSON files, Spark can skip ahead to the most recent checkpoint file.
+
+And when a new commits are added, spark only has to perform incremental processing of the newly added
+JSON files from this starting point.
+
+In the transaction log,
+
+Delta Lake captures also statistics for each added data file.
+These statistics indicate per file the total number of records in the file.
+In addition to several statistics captured by default on the first 32 columns that appear in the table.
+
+Delta Lake File Statistics
+» These statistics indicate per file:
+1. Total number of records
+» Statistics on the first 32 columns of the table
+2. Minimum value in each column
+3. Maximum value in each column
+4. Null value counts for each of the columns
+
+
+Delta Lake File Statistics will always be leveraged by Delta Lake for file skipping.
+So, for example, if you are querying the total number of records in a table.
+
+Delta will not calculate the counts by scanning all data files.
+Instead, it will leverage these File Statistics to generate the query results.
+
+And important note: Nested fields are taken into account when determining the first 32 columns.
+
+For example, if your first four fields are structs with eight nested fields each, they will total
+to the 32 columns.
+
+Also note that Delta Lake file statistics are generally uninformative for string fields with very high cardinality.
+such as free text fields like product reviews and user messages, for example.
+
+Calculating statistics on such a freeform text fields can be time consuming.
+So you need to emit these fields from a statistic collection by setting them later in the schema after the first 32 columns.
+
+Log Retention Period
+» Running the VACUUM does not delete Delta log files
+» Log files are automatically cleaned up by Databricks
+» Each fime a checkpoint is written, Databricks automatically cleans up log entries
+older than the log retention interval (default: 30 days)
+
+IMP:- 
+» By default, you can time travel to a Delta table only up to 30 days old
+» delta. logRetentionburation controls how long the history for a table is kept
+
+-----------------------------------------------------------Extra Info
+
+1. What is a Delta Lake Transaction Log?
+
+Delta Lake is built on Parquet files, but Parquet alone is immutable and schema-less.
+
+To support ACID transactions, Delta maintains a transaction log (_delta_log folder) for every table.
+
+The transaction log is a sequence of JSON + Parquet files that record every change to the table: inserts, updates, deletes, schema changes, and compactions.
+
+Think of it as Delta table’s “ledger” that tracks the entire history of the table.
+
+🔹 2. Location
+
+Every Delta table has a hidden _delta_log folder:
+
+/mnt/delta/my_table/
+    └── _delta_log/
+        ├── 00000000000000000000.json
+        ├── 00000000000000000001.json
+        ├── 00000000000000000002.json
+        └── 00000000000000000002.checkpoint.parquet
+
+
+JSON files → record individual transactions (adds/deletes of files).
+
+Checkpoint Parquet → snapshot of table at certain version for faster reads.
+
+🔹 3. Contents of the Transaction Log
+
+Each transaction log entry contains metadata about what changed in the table:
+
+{
+  "add": {
+    "path": "part-0001.snappy.parquet",
+    "size": 123456,
+    "modificationTime": 169XXX,
+    "dataChange": true
+  }
+}
+
+
+"add" → a new Parquet file added.
+
+"remove" → file deleted (for updates/deletes).
+
+"metaData" → schema info, partitioning info.
+
+"commitInfo" → user, timestamp, operation type (MERGE, DELETE, etc.).
+
+🔹 4. Why Transaction Log Matters
+
+ACID Transactions
+
+Ensures atomicity, consistency, isolation, durability for all operations: insert, update, delete, merge.
+
+Multiple users can safely read/write without conflicts.
+
+Time Travel
+
+Delta stores all historical versions in _delta_log.
+
+You can query previous snapshots:
+
+SELECT * FROM my_table VERSION AS OF 5;
+SELECT * FROM my_table TIMESTAMP AS OF '2025-09-21';
+
+
+Streaming Support
+
+Structured streaming reads only new transactions in _delta_log.
+
+Checkpoints + transaction log enable exactly-once processing.
+
+Data Consistency
+
+Prevents partial writes from appearing in queries.
+
+Guarantees snapshot isolation.
+
+🔹 5. How it Works
+
+Write Operation (INSERT/MERGE/UPDATE/DELETE):
+
+Delta writes new Parquet files for data changes.
+
+Delta appends a JSON transaction file to _delta_log.
+
+Delta updates checkpoint periodically.
+
+Read Operation:
+
+Delta reads latest checkpoint + subsequent JSON logs.
+
+Constructs the current snapshot of the table in memory.
+
+Returns query results.
+
+🔹 6. Advantages of Transaction Log
+
+✅ ACID guarantees for big data.
+✅ Enables time travel & historical audits.
+✅ Allows streaming ingestion with exactly-once semantics.
+✅ Supports schema evolution and schema enforcement.
+✅ Works with Delta’s optimizations like Z-Ordering, Compaction, and Liquid Clustering.
+
+🔹 7. Summary
+Feature	Delta Transaction Log
+Purpose	Tracks every change to the table
+Location	_delta_log folder
+File Types	JSON (transactions) + Parquet (checkpoints)
+Key Uses	ACID, time travel, streaming, schema enforcement
+Benefits	Consistency, history, recoverability, performance
+
+
+🔹 1. JSON Commit Files
+
+Every change (insert, update, delete, merge) in a Delta table is recorded as a JSON file in the _delta_log folder.
+
+Each JSON file lists actions, like:
+
+Adding new data files
+
+Removing old data files
+
+Metadata/schema changes
+
+Problem:
+
+If a table has thousands of commits, reading all JSON files to figure out the current state is slow and inefficient.
+
+🔹 2. Parquet Checkpoints
+
+To speed up table state resolution, Delta Lake automatically creates Parquet checkpoint files every 10 commits.
+
+Checkpoints store the full table state at that moment in Parquet format, which Spark can read much faster than JSON files.
+
+How it helps:
+
+When Spark reads a Delta table, it can start from the latest checkpoint instead of processing all JSON logs.
+
+Then it only needs to process new JSON commits after that checkpoint.
+
+🔹 3. File Statistics
+
+Delta logs statistics for each Parquet file, including:
+
+Total number of records in the file
+
+Min and max values for the first 32 columns
+
+Count of nulls for those columns
+
+Nested fields are also counted. For example:
+
+4 struct columns with 8 nested fields each → counts as 32 columns.
+
+Use case:
+
+When running queries like COUNT(*) or WHERE filters, Delta can use file statistics instead of scanning all the data.
+
+This is called file skipping, which dramatically improves performance.
+
+Limitations:
+
+High-cardinality string columns (like free text) are not useful for statistics.
+
+You can exclude such fields from statistics collection if needed.
+
+🔹 4. Transaction Log Retention & VACUUM
+
+VACUUM command: Deletes old data files from the table, not JSON logs.
+
+Transaction logs (JSON + checkpoints) are automatically cleaned up when a new checkpoint is written.
+
+Default retention: 30 days, meaning you can time travel only up to 30 days back.
+
+You can change this with the table property:
+
+ALTER TABLE my_table
+SET TBLPROPERTIES ('delta.logRetentionDuration' = 'interval 60 days');
+
+🔹 5. Key Points to Remember
+Concept	What it Does
+JSON commit files	Track every change to table
+Parquet checkpoint files	Full snapshot for faster reads
+File statistics	Min/max/nulls for first 32 columns → enable file skipping
+VACUUM	Deletes old data files, not logs
+Log retention	Delta automatically cleans old logs; default 30 days
+🔹 6. Why It Matters
+
+Performance: Reading checkpoints + file statistics → faster queries.
+
+Streaming & batch: Incremental reads work efficiently.
+
+Time travel: You can access historical data efficiently.
+
+Consistency: Delta ensures ACID compliance and correct snapshots.
+
+💡 Analogy:
+
+JSON commits = every small transaction in a ledger
+
+Checkpoint = periodic snapshot of your ledger balance
+
+File statistics = summaries in the ledger (total, min, max) to avoid checking every transaction
+
+-----------------------------------------------------------Extra Info Ended
+
+27. Transaction Log(Hands On)----------------------------------------------------------
+
+Delta Lake file statistics are accessible in this Add column.
+
+For each added file we see here it is statistics. These include the total number of records in the file.
+
+In this case, 12 records.
+As well as the minimum value, maximum value and the count of null values for each column in our bronze table.
+
+Remember, these statistics are limited to the first 32 columns in the table.
+
+Imp:- When querying the total number of records in a table,
+even if you have a huge table, you will notice that querying its count is super fast.
+
+Delta Lake does not need to calculate the count by scanning all data files.
+Instead, it will use the information stored in the transaction log to return the query results.
+
+
+
+::  Let us now review the transaction log checkpoints.
+Let us list again the files in the delta log directory of our bronze table. If you scroll down,
+we notice that version 10 of the table has both a JSON file and a Parquet checkpoint file associated with it.
+
+Imp:- Databricks automatically creates these checkpoint files every ten commits in order to accelerate the resolution of the current table state.
+
+As you can see, rather than only showing the operations of the most recent transaction, this checkpoint
+file condenses all of the adds and remove instructions and valid metadata into a single file.
+
+This means that in order to find the data files currently representing the valid table version,
+there is no need to load many JSON files and comparing those data files listed in the Add and Remove columns.
+
+Only this single file can be loaded that fully describes the table state.
+
+28. Auto Optimize----------------------------------------------------------
+
+We know that Delta Lake supports compacting small files by manually running the OPTIMIZE command.
+In this case, the target file size is typically 1 GB.
+
+Delta Lake can also automatically compact small files.
+This can be achieved during individual writes to a Delta table.
+
+
+Auto Optimize |
+1- Automatically compacts small files during individual writes to a table
+
+2- Auto optimize consists of two complementary features complementary features---
+
+i. Optimized writes: With optimized writes enabled, Databricks attempts to write out 128 MB files for each partition.
+
+ii. Auto compaction: |
+
+» After the write completes, it checks if files can further be compacted
+
+» If yes, it runs an OPTIMIZE job toward a file size of 128 MB (instead of 1 G8)
+
+Note:- Auto compaction does not support Z-Ordering as Z-Ordering is significantly more expensive than just compaction.
+
+
+You can explicitly enable optimized writes and auto compaction when creating or altering a Delta table.
+
+Simply set to true both table properties:
+
+delta.autoOptimize.OptimizeWrite
+delta.autoOptimize.autoCompact
+
+Examples----
+» New tables
+> CREATE TABLE myTeble (id INT, name STRING)
+TBLPROPERTIES (delta.autoOptimize.optinizeWizite = true,
+delta. autoOptimize.autoCompact = true)
+
+» Existing fable
+> ALTER TABLE myTable
+SET TBLPROPERTIES (celta.autoOptimize.optimizeRrite - true,
+delta.autoOptimize.autoCompact = true)
+
+In addition, you can enable or disable both of these features for Spark sessions with the following two configurations:
+» Spark sessions
+» spark.databricks.delta.optinizeWrite.enabled
+» spark.databricks.delta.autoCompact.enabled
+
+Note:- These session configurations take precedence over the table properties allowing you to better control when
+to opt in or to opt out of these features.
+
+In fact, having many small files is not always a problem since it can lead to better data skipping.
+Also, it can help minimize rewrites during some operations like merges and deletes.
+
+Databricks can automatically tune the file size of Delta tables, based
+on workloads operating on the table.
+
+» For Frequent MERGE operations, Optimized Writes and Auto Compaction wil
+generate data files smaller than 128 MB. This helps in reducing the duration of
+future MERGE operations.
+
+
+29. Python UDFs-------------------------------------------------------------
+
+In this lecture we are going to explore Python user defined functions in spark.
+
+User Defined Functions or UDFs.
+Create a function for custom column transformation.
+
+We start by defining a classical Python function.
+
+Here we have a simple function to apply discount percentage on a price.
+def apply_discount(price, percentage):
+	return price * (1- percentage)
+	
+It's a classical Python function, so let us call it to test it.
+
+Here we are applying a 20% discount on a price of 100.
+Great.
+
+print(apply_discount(100, 20))
+We got 80 after discount.
+
+Now in order to be able to use this function on a pi spark dataframe, we need to register this function as a UDF.
+For this we are going to use the UDF function and we pass our Python function as a parameter.
+
+apply_discount_udf = udf(apply_discount)
+
+Now we have our Python UDF function called apply discount UDF.
+Let us apply the UDF on the price column of our books table.
+
+The first parameter is the price column and the second is the literal value of 50.
+
+For applying 50% discount.
+
+from pyspark.sql. functions import col, lit
+df_discounts = df_books.select(price, apply_discount_df (col ("price"), lit(50))).
+display(df_discounts)
+
+Note:
+However, this UDF cannot be used in SQL.
+Instead, we can use another function to declare the UDF.
+
+IMP:
+The spark UDF register function makes the UDF available for use in both Python and SQL.
+
+apply_discount_py_udf = spark.udf.register("apply_discount_sql_udf" ,apply_discount)
+
+This creates a SQL function called - apply_discount_sql_udf 
+and 
+in the same time it creates a Python UDF called - apply_discount_py_udf
+
+IMP:
+Alternatively you can define and register a UDF using Python decorator syntax.
+
+@udf("double")
+def apply_discount_decorator_udf (price, percentage):
+	return price * (1 - percentage/100)
+
+The UDF decorator parameter is the column data type.
+The function returns.
+
+It means our UDFs input and output is of type double.
+
+Note:- However, in this way you will no longer be able to call the local Python function.
+
+LIMITATION:
+The problem with Python UDFs is that they cannot be optimized by spark.
+And in addition, there is a cost of transferring data between spark engine and Python interpreter.
+
+SOLUTION:
+One way to improve the efficiency of UDFs in Python is to use pandas UDFs.
+Pandas UDFs are vectorized UDFs that use Apache Arrow format.
+
+import pandas as pd
+
+from pyspark.sql.functions import pandas_udf
+
+def vectorized_udf(price: pd.Series, percentage: pd.Series,) -> pd.Series:
+return price + (1 - percentage/108)
+
+vectorized_udf = pandas_udf(vectorized_udf, "double")
+
+Apache arrow is an in-memory data format that enables fast data transfers between Spark's JVM and Python
+runtimes, which reduces computational and serialization costs.
+
+Notice here that we are using pandas UDF function to define our vectorized UDF, and we specify that
+the input and the output is of type double.
+Alternatively, we can declare it with a decorator.
+
+df_domains = df_books. select("price", vectorized_udf(col("price"), 1it(50)))
+display (df_domains)
+
+In addition, you can register pandas UDFs to the SQL namespace.
+
+spark.udf.register("sql_vectorized_udf", vectorized_udf)
+Let us confirm this.
+
+30. Python UDFs on Groups-------------------------------------------------------------
+
+Pandas UDFs on Groups
+In Apache Spark, you can apply custom Pandas-based operations on grouped data within a PySpark DataFrame. This allows you to perform group-level operations using familiar Pandas code while still benefiting from Spark’s distributed processing engine. To achieve this, use the applyInPandas function.
+
+
+
+Syntax
+
+A typical syntax looks like this:
+
+df.groupby("key").applyInPandas(custom_function, schema)
+
+Here, custom_function is a user-defined function (UDF) that accepts a Pandas DataFrame and returns another, while schema defines the structure of the output DataFrame. Spark handles the parallelization by splitting the data by groups and running the UDF across worker nodes. Each group is sent as a pandas DataFrame to the UDF, which preserves row order and allows running custom, stateful algorithms (e.g., rolling windows, and cumulative calculations).
+
+
+
+Example
+
+We can use applyInPandas on our customers_orders table to calculate the average quantity of orders per country. Here’s an example in PySpark:
+
+
+
+import pandas as pd
+ 
+schema = "country STRING, avg_quantity DOUBLE"
+ 
+def avg_per_country(pdf):
+    return pd.DataFrame({
+        "country": [pdf["country"].iloc[0]],
+        "avg_quantity": [pdf["quantity"].mean()]
+    })
+ 
+df = spark.table("customers_orders")
+result = df.groupBy("country").applyInPandas(avg_per_country, schema)
+display(result)
+
+
+The output will display the average quantity per country, as follows:
+
+In practice, applyInPandas is widely used in data science workflows, particularly when analysts want to integrate Pandas’ rich ecosystem (such as NumPy, SciPy, or scikit-learn) into scalable Spark pipelines.
+
+
+
+SECTION 5: Databricks Tooling-------------------------------------------------------------
+
+31. Databricks Jobs(Hands On)----------------------------------------------------------
+
+1. We can set parameters in Job configurations and pass them to notebook parameters.
+2. Retry Policy:- A retry policy can be set at can be for some N number of retries or UNLIMITED retries
+N tries means N+1 runs(the 1st run + N retries)
+
+3. Note:  here when you choose unlimited retry policy, keep these maximum concurrent runs to 1.
+
+Like this, You don't have to worry about a ton of jobs running one after another in parallel in case of failure.
+So it will be just a serial failure.
+
+4. We can depends one task on multiple previous tasks, or we can add the previous task to multiple next task.
+
+32. Advanced Jobs Configurations (Hands On)----------------------------------------------------------
+
+we are going to see some advanced configurations for Databricks Jobs.
+
+1. Job Scheduling
+In the right side panel, we see the Schedule section where you can schedule your job.
+
+i.  Click on the "Add schedule" button to explore scheduling options.
+ii. Changing the schedule type from manual to scheduled will bring up a cron scheduling UI.
+iii.This UI provides extensive options for setting up chronological scheduling of your jobs.
+iv. You can anytime pause your schedule. And resume it. Or even completely deleted.
+
+2. Permissions
+In the permission section, we see that my training account is currently the owner of the job.
+
+The owner has full permission on the job. In addition, his credential will be used to run the job.
+
+Note:- Important remark here is that the JOB owner must be an individual user, not a group of users.
+
+33. Troubleshooting Jobs failures (Hands On)----------------------------------------------------------
+
+IMP:- RERUN can be used to rerun only the failed tasks in the JOB workflow.
+
+34. REST API (Hands On)
+
+35. Databricks CLI (Hands On)----------------------------------------------------------
+
+1. Install Databricks CLI
+pip install databricks-cli
+
+2. Now we need to configure the connection to our Databricks workspace.
+databricks configure --token
+
+Copy the workspace URL with the HTTP protocol. And paste it here.
+
+3. Next, enter your personal access token generated in the last lecture or you can generate a new one.
+
+Note:- 
+You can see your configurations by navigating to your username folder.
+
+Here. Look at the databricks config file.
+
+And open it with a Notepad.
+As you can see in this file, you have the workspace URL, and your token in plain text.
+
+
+4. 
+To see the list of options run the help command:
+
+>databricks -h
+
+Similar to Databricks API,
+
+The CLI allows you to manage various Databricks resources like jobs and clusters.
+
+In fact, the CLI is built on top of the Databricks REST API.
+
+5. You can view all the clusters in your Databricks workspace by running clusters list command.
+
+> databricks clusters list 
+
+As you can see, this shows both all-purpose clusters and also job clusters.
+
+6. Start Clsuter
+> databricks clusters start --cluster-id <ID> 
+
+7. Run > databricks clusters list  to see the status of cluster.
+
+8. To interact with DBFS, we use the fs command.
+> dbfs fs
+
+
+> dbfs fs cp
+However, cp is particularly interesting because it's not only used for copying files within DBFS, but
+
+it can be also used to copy files from your local file system to DBFS and vice versa.
+
+Let us try to upload a JSON file from our local file system to DBFS.
+
+Our local file is located in the C drive in a folder called data, and we will use the mode overwrite
+
+in case the file is already in DBFS in this location.
+
+
+9. Databricks Secret
+> databricks secrets
+
+> databricks secrets create-scope --scope bookstore-dev
+
+Our secret scope is currently empty. Let us put a secret into this scope.
+A secret is a key-value pair representing sensitive information such as passwords.
+
+> databricks secrets put --scope bookstore-dev --key db password --string-value 12345
+
+list secrets
+
+> databricks secrets list --scope bookstore-dev
+
+To use secret in databricks 
+> dbutils.secrets.help()
+> dbutils.secrets.get(scope = '' , key = '')
+
+
+-------------------------------------------SEction 6: Security and Governance Solution-------------------------------------------
+
+36. Propagating Delete CLI (Hands On)----------------------------------------------------------
+
+In this lecture, we will demonstrate how to incrementally process delete requests and propagating deletes through the lakehouse.
+
+Note:- Delete requests are also known as requests to be forgotten.
+
+They require deleting user data that represent Personally Identifiable Information or PII, such as the name and the email of the user.
+
+
+-----------
+We set up a table called delete_requests to track users requests to be forgotten.
+
+These requests are received in the bronze table as CDC feed of type "delete" in the customers topic.
+
+While it is possible to process deletes at the same time as inserts and updates CDC feed,
+the fines around right to be forgotten requests may require a separate process.
+
+Here we indicate the time at which the delete was requested.
+And we add 30 days as a deadline to ensure compliance.
+
+from pyspark.sql import functions as F
+
+schema = "customer_id STRING, email STRING, first_name STRING, last_name STRING, gender STRING, street STRING, city STRING, country_code STRING, row_status STRING, row_time timestamp"
+
+(spark.readStream
+        .table("bronze")
+        .filter("topic = 'customers'")
+        .select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
+        .select("v.*", F.col('v.row_time').alias("request_timestamp"))
+        .filter("row_status = 'delete'")
+        .select("customer_id", "request_timestamp",
+                F.date_add("request_timestamp", 30).alias("deadline"), 
+                F.lit("requested").alias("status"))
+    .writeStream
+        .outputMode("append")
+        .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/delete_requests")
+        .trigger(availableNow=True)
+        .table("delete_requests")
+)
+
+
+In addition, we provide a field that indicates the current processing status of the request.
+Let us run this streaming query.
+
+---------
+SELECT * FROM delete_requests
+
+Let us now review the delete_requests table.
+
+As you can see, we have 126 delete requests.
+---------
+
+Now we can start deleting user records from the customers table based on the customer ID.
+
+DELETE FROM customers_silver
+WHERE customer_id IN (SELECT customer_id FROM delete_requests WHERE status = 'requested')
+
+Indeed, we deleted all the 126 records.
+
+---------
+
+We know that in a previous lecture we enabled CDF on the customers table.
+So we can leverage CDF data as an incremental records of data changes to propagate deletes to downstream tables.
+
+Here, we can figure an incremental read of all change events committed to the customers table.
+
+deleteDF = (spark.readStream
+                 .format("delta")
+                 .option("readChangeFeed", "true")
+                 .option("startingVersion", 2)
+                 .table("customers_silver"))
+				 
+
+
+
+
+# COMMAND ----------
+Now we define a function to be called with foreachBatch in order to process the delete events.
+
+Here we commit deletes to other tables containing data in our pipeline.
+
+In our case, it's only one table, which is the customers_orders
+
+
+def process_deletes(microBatchDF, batchId):
+    
+    (microBatchDF
+        .filter("_change_type = 'delete'")
+        .createOrReplaceTempView("deletes"))
+
+    microBatchDF._jdf.sparkSession().sql("""
+        DELETE FROM customers_orders
+        WHERE customer_id IN (SELECT customer_id FROM deletes)
+    """)
+    
+    microBatchDF._jdf.sparkSession().sql("""
+        MERGE INTO delete_requests r
+        USING deletes d
+        ON d.customer_id = r.customer_id
+        WHEN MATCHED
+          THEN UPDATE SET status = "deleted"
+    """)
+	
+Once finished, we perform an update back to the delete_requests table to change the status of the request to deleted.
+
+
+# COMMAND ----------
+
+
+(deleteDF.writeStream
+         .foreachBatch(process_deletes)
+         .option("checkpointLocation", "dbfs:/mnt/demo_pro/checkpoints/deletes")
+         .trigger(availableNow=True)
+         .start())
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM delete_requests
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC DESCRIBE HISTORY customers_orders
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM customers_orders@v6
+# MAGIC EXCEPT
+# MAGIC SELECT * FROM customers_orders
+
+# COMMAND ----------
+
+df = (spark.read
+           .option("readChangeFeed", "true")
+           .option("startingVersion", 2)
+           .table("customers_silver")
+           .filter("_change_type = 'delete'"))
+display(df)
+
+-----------------------------------------------------------Extra Info
+
+🧩 Propagating Deletes in Databricks (Bronze → Silver → Gold)
+🌍 1. Core Idea
+
+In a typical medallion architecture (Bronze → Silver → Gold), data flows via structured streaming.
+Deletes in upstream tables must be handled carefully — otherwise, downstream streaming checkpoints will break.
+
+Hence, Databricks provides Change Data Feed (CDF) to propagate deletes safely through streaming pipelines.
+
+🪞 2. Why Deleting Data Is a Problem
+
+Structured Streaming in Databricks assumes data is append-only.
+
+If you physically delete rows or files from a Delta table being used as a streaming source:
+
+The checkpoint references file versions that no longer exist.
+
+Streaming reader cannot “unread” old data.
+
+Result: ❌ Checkpoint breaks, stream fails.
+
+⚙️ 3. What Happens Without CDF
+
+Example:
+
+DELETE FROM bronze_table WHERE order_id = 'O123';
+
+
+Bronze physically removes those records and rewrites Parquet files.
+
+_delta_log reflects a new table version without those rows.
+
+Silver stream’s checkpoint still points to older file versions (where the deleted data existed).
+
+When the Silver stream restarts → it can’t find expected files → ❌ Stream fails or becomes inconsistent.
+
+Hence:
+
+🔸 Do not delete directly from a table that’s a streaming source.
+
+🧱 4. How CDF (Change Data Feed) Solves This
+
+When CDF is enabled:
+
+ALTER TABLE bronze_table SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+
+Delta starts tracking all row-level changes in an internal feed:
+
+Change Type	Description
+insert	New record added
+update_preimage	Old version before update
+update_postimage	New version after update
+delete	Record removed (soft delete marker)
+
+So instead of vanishing data, Delta records logical change events (including deletes).
+This allows downstream tables to react properly, rather than crash.
+
+⚗️ 5. How Deletes Are Propagated Downstream
+
+Bronze → Silver:
+
+Silver reads Bronze using the CDF stream:
+
+spark.readStream \
+  .option("readChangeFeed", "true") \
+  .option("startingVersion", 1) \
+  .table("bronze_table") \
+  .writeStream \
+  .option("checkpointLocation", checkpoint_path) \
+  .foreachBatch(process_silver_merge) \
+  .start()
+
+
+Inside process_silver_merge (or SQL MERGE):
+
+MERGE INTO silver_table AS s
+USING bronze_changes AS b
+ON s.id = b.id
+WHEN MATCHED AND b._change_type = 'delete' THEN DELETE
+WHEN MATCHED AND b._change_type = 'update_postimage' THEN UPDATE SET *
+WHEN NOT MATCHED AND b._change_type = 'insert' THEN INSERT *
+
+
+This way:
+
+Inserts propagate normally ✅
+
+Updates modify downstream ✅
+
+Deletes remove the matching records ✅
+
+Silver → Gold follows the same pattern.
+
+💡 6. When Using Deletes
+Layer	Handling	Recommended Action
+Bronze (source)	Avoid direct deletes	❌ Use CDF if deletion is necessary
+Bronze (with CDF)	Soft deletes (change markers)	✅ Safe for streaming
+Silver (CDF consumer)	Merge logic applies delete	✅ Records physically deleted
+Gold (CDF consumer)	Merge logic applies delete	✅ Final cleaned view
+
+🔍 7. Soft Delete vs Physical Delete
+Type	Meaning	CDF View	Stream Safety
+Physical Delete	Data actually removed	❌ No record of deletion	❌ Breaks stream
+Soft Delete	Data marked as deleted but retained in log	✅ Recorded in CDF as _change_type='delete'	✅ Safe
+
+So, in Bronze → data appears deleted to users but technically remains traceable via logs.
+In Silver and Gold → delete logic physically removes those records safely.
+
+🪄 8. Key Properties and Options
+Option	Description	Usage
+delta.enableChangeDataFeed	Enables CDF tracking	Set on Bronze and Silver tables
+readChangeFeed	Reads from CDF instead of raw data	Used in Silver/Gold streaming reads
+ignoreDeletes	Ignores deletes in stream source	Use if deletions should not stop streaming
+enableDeletes	Allows stream to process delete operations	Use when propagating deletes downstream
+🧠 9. When to Use CDF
+
+✅ Use CDF if:
+
+You need to propagate deletes or updates safely.
+
+You have multiple downstream tables dependent on a source.
+
+You require auditability (track what changed when).
+
+You’re building incremental ETL pipelines (Bronze → Silver → Gold).
+
+❌ Avoid CDF if:
+
+Data is strictly append-only and no deletes/updates will ever happen.
+
+You only do batch refreshes (not streaming).
+
+You’re optimizing for minimal metadata overhead.
+
+🔥 10. Typical Implementation Flow
+
+Enable CDF on Bronze:
+
+ALTER TABLE bronze_table SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+
+Stream from Bronze → Silver with:
+
+spark.readStream.option("readChangeFeed", "true").table("bronze_table")
+
+
+Apply Merge Logic:
+
+Use _change_type to apply INSERT, UPDATE, or DELETE.
+
+Repeat for Silver → Gold layers.
+
+Maintain Checkpoints:
+
+Each stream has its own checkpoint path.
+
+CDF ensures checkpoints remain valid even after deletes.
+
+🧾 11. Key Takeaways Summary
+
+Concept	Description
+Streaming assumes append-only	Deleting breaks checkpoints
+CDF adds row-level change tracking	Allows safe propagation of deletes/updates
+Bronze	May contain soft deletes (via CDF)
+Silver/Gold	Consume CDF, perform physical deletes via merge
+Without CDF	Manual deletes → checkpoint break
+With CDF	Deletes propagated safely and automatically
+Use ignoreDeletes	If you don’t want deletes to stop streaming
+Always enable CDF early	So changes are tracked from start (retroactive enabling only tracks future changes)
+
+🧩 12. Example: End-to-End SQL Flow
+-- Enable CDF
+ALTER TABLE bronze_orders SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- Delete record in Bronze
+DELETE FROM bronze_orders WHERE order_id = 'O123';
+
+-- Read changes in Silver
+CREATE OR REPLACE STREAMING LIVE TABLE silver_orders
+AS
+SELECT *
+FROM table_changes('bronze_orders', 1)
+WHERE _change_type IN ('insert', 'update_postimage', 'delete');
+
+
+Downstream logic applies merge/delete appropriately.
+
+⚡ 13. In Short — TL;DR
+Question	Answer
+Why not delete directly?	Breaks streaming checkpoints due to append-only assumption
+What to use instead?	Change Data Feed (CDF)
+What does CDF do?	Tracks inserts, updates, deletes as change events
+How does Silver know what to delete?	Reads _change_type='delete' and applies delete in merge
+Are records really deleted?	Yes, from Silver/Gold; Bronze holds logical delete markers
+What if CDF not enabled?	You must reload data or reset checkpoint manually
+Is delete propagated automatically?	Yes, through CDF-based streaming
+Should you enable CDF everywhere?	Enable on tables that are streaming sources or need incremental updates
+				 
+				 
+-----------------------------------------------------------Extra Info Ended
+
+37. Dynamic Views (Hands On)----------------------------------------------------------
+
+In this lecture, we are going to see how to create dynamic views in Databricks.
+
+Note :- Dynamic views allow identity ACL or Access Control List to be applied to data in a table at the column or row level.
+
+So users with sufficient privileges will be able to see all the fields, while restricted users will
+be shown arbitrary results as defined at view creation.
+
+# Databricks notebook source
+%run ../Includes/Copy-Datasets
+
+# COMMAND ----------
+
+%sql 
+DESCRIBE TABLE customers_silver
+
+# COMMAND ----------
+
+%sql
+CREATE OR REPLACE VIEW customers_vw AS
+  SELECT
+    customer_id,
+    CASE 
+      WHEN is_member('admins_demo') THEN email
+      ELSE 'REDACTED'
+    END AS email,
+    gender,
+    CASE 
+      WHEN is_member('admins_demo') THEN first_name
+      ELSE 'REDACTED'
+    END AS first_name,
+    CASE 
+      WHEN is_member('admins_demo') THEN last_name
+      ELSE 'REDACTED'
+    END AS last_name,
+    CASE 
+      WHEN is_member('admins_demo') THEN street
+      ELSE 'REDACTED'
+    END AS street,
+    city,
+    country,
+    row_time
+  FROM customers_silver
+
+# COMMAND ----------
+
+%sql
+SELECT * FROM customers_vw
+
+
+For low level access control, we can add WHERE clauses to filter source data on different conditions.
+
+On the other hand, users that are not members of the specified group will only be able to see records
+
+for France that have been updated after the specified date.
+
+And note that views can be layered on top of one another.
+
+
+# COMMAND ----------
+
+%sql
+CREATE OR REPLACE VIEW customers_fr_vw AS
+SELECT * FROM customers_vw
+WHERE 
+  CASE 
+    WHEN is_member('admins_demo') THEN TRUE
+    ELSE country = "France" AND row_time > "2022-01-01"
+  END
+
+And note that views can be layered on top of one another.
+Here. The customer view from the previous step is modified with conditional row access.
+
+Let us run this to create our new view.
+# COMMAND ----------
+
+%sql
+SELECT * FROM customers_fr_vw
+
+
+
+38. Row Filters and Column Masks----------------------------------------------------------
+In the last lecture, we covered dynamic views as a solution to share filtered data. However, this approach required creating additional objects within the schema. Unity Catalog now simplifies this process by supporting row filters and column masks directly on the table itself. So, when querying the table, users automatically see only the rows and columns they are authorized to access.
+
+
+
+Column masks
+
+To dynamically mask a column in a table, start by defining the masking logic in a user-defined function. For example:
+
+
+
+CREATE FUNCTION email_mask(email STRING)
+RETURN CASE WHEN is_member('admins_demo') THEN email ELSE 'REDACTED' END;
+
+
+Now, you can apply this function on the column in your table:
+
+ALTER TABLE customers_silver ALTER COLUMN email SET MASK email_mask;
+
+38. Row Filters and Column Masks
+
+Row filters
+
+To dynamically filter rows in a table, start by defining the filtering logic in a user-defined function. For example:
+
+
+
+CREATE FUNCTION fr_filter(country STRING)
+RETURN IF(is_member('admins_demo'), true, country="France");
+
+
+Now, you can apply this function as a row filter on the table:
+
+ALTER TABLE customers_silver SET ROW FILTER fr_filter ON (country);
+
+
+Note: that the is_member function tests group membership at the workspace level. To test group membership at the account level in Unity Catalog, use the is_account_group_member function instead.
+
+
+💡 Context: Dynamic Views, Row Filters, and Permissions
+
+When you use Dynamic Views in Databricks Unity Catalog, you can apply row-level and column-level security — basically, you show or hide data depending on who is querying the table/view.
+
+To make that happen, you often use functions like is_member() or is_account_group_member() in your SQL logic.
+
+🧠 What is is_member()?
+
+is_member('group_name') checks whether the current user belongs to a workspace-level group.
+
+This was the older way before Unity Catalog centralized access control.
+
+It works fine inside a single workspace, but it doesn’t understand Unity Catalog account-level groups.
+
+🧩 Example (workspace-level):
+
+CREATE OR REPLACE VIEW sales_dynamic_view AS
+SELECT *
+FROM sales
+WHERE
+  CASE
+    WHEN is_member('finance_team') THEN true
+    ELSE region = 'public'
+  END;
+
+
+Here, only users in the finance_team workspace group see all rows; others see filtered rows.
+
+🧠 What is is_account_group_member()?
+
+is_account_group_member('group_name') is the Unity Catalog–aware version.
+
+It checks whether the user belongs to a group at the account level, not just within the workspace.
+
+This is critical when:
+
+You have multiple workspaces under the same Unity Catalog account.
+
+Your groups are managed in SCIM / Azure AD / Okta (i.e., centralized identity management).
+
+You want consistent access control across all workspaces.
+
+🧩 Example (account-level):
+
+CREATE OR REPLACE VIEW customer_sensitive_view AS
+SELECT
+  customer_id,
+  CASE
+    WHEN is_account_group_member('PII_ACCESS_TEAM') THEN email
+    ELSE NULL
+  END AS email_masked
+FROM customers;
+
+
+➡️ Here, only users in the PII_ACCESS_TEAM group (defined in Unity Catalog) can see actual emails; others see NULL.
+
+⚙️ Key Difference Summary
+Function	Checks Group At	Works In	Use Case
+is_member('group')	Workspace level	Only inside a specific workspace	Legacy or workspace-specific access
+is_account_group_member('group')	Account (Unity Catalog) level	Across all Unity Catalog workspaces	Recommended for all UC-managed tables
+🚨 Why this matters
+
+If you use is_member() in a Unity Catalog view, your row filters or column masks might fail or behave inconsistently — because Unity Catalog doesn’t automatically know about workspace-level groups.
+
+✅ Best practice:
+Always use is_account_group_member() when defining access policies in Unity Catalog.
+
+🔐 Quick Tip for Your Notes
+
+Use is_account_group_member() for consistent, account-wide dynamic access control in Unity Catalog.
+Use is_member() only for legacy or workspace-specific setups.
+
+
+-------------------------------------------Section 7: Testing and Deployment-------------------------------------------
+
+39. Relative Imports (Hands On)----------------------------------------------------------
+
+In this lecture, we are going to see how relative imports can be used instead of the %run magic command.
+We know that the %run magic command is used to run another notebook from the current notebook.
+
+🧩 Relative Imports in Databricks — Full Detailed Explanation
+🚀 1. What Are Imports in Python?
+
+In Python, the import statement lets you reuse code from another file or module instead of writing it again.
+
+Example:
+
+from math import sqrt
+
+
+Here you’re importing the sqrt function from Python’s built-in math module.
+
+Similarly, you can create your own modules — like cube.py — and import them:
+
+from helpers.cube import Cube
+
+🧱 2. Absolute vs. Relative Imports
+
+There are two ways Python can locate and import your code:
+
+Type	Example	Meaning
+Absolute Import	from helpers.cube import Cube	Starts from the project root or a directory in sys.path
+Relative Import	from .cube import Cube	Starts relative to the current file’s location
+
+So:
+
+Absolute import = works from project root (most common).
+
+Relative import = uses . or .. to refer to sub-packages.
+
+🧠 3. Why Databricks Is Special
+
+Unlike standard Python projects, Databricks notebooks are not normal .py files.
+
+A notebook is stored as a JSON-like object, and in the source view it begins with:
+
+# Databricks notebook source
+
+
+This means it’s not treated as a Python module, so you cannot use import directly on a notebook.
+
+That’s why this fails:
+
+from helpers.cube import Cube
+
+
+if cube is a notebook, not a .py file.
+
+⚙️ 4. %run Magic Command — Databricks-Only Solution
+
+Databricks created a shortcut called %run, which allows you to “run” another notebook and bring all its variables and functions into the current one.
+
+Example:
+
+%run ./helpers/cube_notebook
+
+
+✅ What happens:
+
+Databricks executes that notebook.
+
+All classes, variables, and functions become available in your current notebook.
+
+❌ Limitation:
+
+%run is Databricks-only, not valid in regular Python.
+
+It imports everything, not specific classes.
+
+It’s hard to reuse or test outside Databricks.
+
+Hence, %run = good for quick work, but bad for modular and scalable codebases.
+
+🧩 5. The Pythonic Alternative: Relative Imports
+
+To make your Databricks project modular and production-ready, use relative (or absolute) imports with .py files instead of notebooks.
+
+Example Folder Structure:
+repos/
+ └── my_project/
+     ├── helpers/
+     │    └── cube.py
+     ├── notebooks/
+     │    └── use_cube.ipynb
+     └── modules/
+          └── math_utils.py
+
+
+In your notebook (use_cube.ipynb):
+
+from helpers.cube import Cube
+
+📁 6. How To Create .py Files in Databricks
+
+Databricks Repos normally hold notebooks, not files.
+
+To use .py imports:
+
+Go to your Databricks Repo (created via Git integration).
+
+Click Create → File.
+
+Name it cube.py.
+
+Paste your code:
+
+class Cube:
+    def __init__(self, edge):
+        self.edge = edge
+
+    def volume(self):
+        return self.edge ** 3
+
+
+Save.
+
+If you don’t see “Create → File”, your workspace admin must enable it:
+
+Settings → Workspace → Repos → Enable “Files in Repos” → Save → Refresh
+
+🔍 7. How Python Finds Your Modules
+
+Python looks for importable modules using the sys.path list.
+
+Check it using:
+
+import sys
+print(sys.path)
+
+
+You’ll see:
+
+The current working directory (Databricks notebook directory)
+
+Standard library paths
+
+So if your module (cube.py) is inside that working directory or its subfolders — it’s automatically importable.
+
+🧭 8. What If My File Is Outside the Current Folder?
+
+If your helper modules are outside the working directory, Python won’t find them automatically.
+
+Example:
+
+repos/
+ ├── notebooks/
+ └── modules/
+      └── shapes/
+          └── cube.py
+
+
+You can manually append the path:
+
+import sys
+sys.path.append("/Workspace/Repos/username/my_project/modules")
+
+
+Now you can do:
+
+from shapes.cube import Cube
+
+🧪 9. Testing That It Works
+
+Once the import works:
+
+from helpers.cube import Cube
+
+c = Cube(3)
+print(c.volume())
+
+
+✅ Output → 27
+
+That confirms your relative import is functional.
+
+⚡ 10. Using Python Wheels in Databricks (Optional Advanced Step)
+
+If your code becomes large or shared across multiple repos, package it as a Python wheel (.whl file).
+
+Install using:
+
+%pip install /Workspace/Repos/username/my_lib-0.1-py3-none-any.whl
+
+
+Then:
+
+from my_lib.helpers.cube import Cube
+
+
+🧠 %pip is better than %sh pip install because:
+
+It installs packages on all cluster nodes.
+
+It automatically restarts the Python kernel.
+
+Always put %pip install at the top of your notebook.
+
+📊 11. Comparison — %run vs. Relative Import
+Feature	%run	Relative Import
+Type	Databricks-only	Pure Python
+Scope	Imports entire notebook	Imports selected module/class
+Portability	❌ Not portable	✅ Portable anywhere
+Scalability	❌ Hard for large projects	✅ Best for modular code
+Use case	Quick test notebooks	Production pipelines
+✅ 12. Best Practices Summary
+Task	Best Practice
+Organize code	Put shared code in .py files under /helpers or /modules
+Importing	Use from helpers.filename import class/function
+Add custom path	sys.path.append() for external dirs
+Avoid	Using %run for production
+Wheel usage	Package shared logic as .whl
+Cluster install	Always use %pip install not %sh
+Enable	“Files in Repos” in Databricks settings
+💡 13. Why This Matters
+
+Relative imports make your Databricks code:
+
+Modular → Easier to maintain and reuse
+
+Testable → Can be used in CI/CD pipelines
+
+Portable → Works both in Databricks and outside (local Python)
+
+Clean → Avoids clutter of notebook-level %run commands
+
+🧩 14. Mini Example — Everything Together
+
+1️⃣ File: /helpers/cube.py
+
+class Cube:
+    def __init__(self, edge):
+        self.edge = edge
+
+    def volume(self):
+        return self.edge ** 3
+
+
+2️⃣ Notebook: /notebooks/use_cube
+
+# Optional: add path if helpers not in same directory
+import sys
+sys.path.append("/Workspace/Repos/username/my_project/helpers")
+
+# Import class
+from cube import Cube
+
+# Use class
+c = Cube(3)
+print(c.volume())   # Output: 27
+
+
+
+40. Data Pipeline Testing----------------------------------------------------------
+
+In this lecture we will discuss data pipeline testing on Databricks.
+
+You will understand the two categories of data pipeline tests.
+
+And you will learn about the different types of standard tests for data projects.
+
+There are two categories of tests for data pipelines.
+
+Data quality tests and standard tests.
+
+1. Data quality tests are used to test the quality of the data.
+
+For example, you can test that a column price has only values greater than zero.
+
+2. Standard tests are used to test the code logic.
+
+These tests are run every time your code is modified.
+
+There are three common types of standard tests.
+
+Unit testing, integration testing and end to end testing.
+This allows you to find problems with your code faster and earlier in the development life cycle.
+
+i. Unit tests are done using assertions.
+
+An assertion is a statement that enables you to test the assumption you have made in your code.
+It is simple to use by adding the assert keyword followed by a boolean condition.
+
+assert func() == expected_value
+With assertions you check if your assumptions remain true
+
+while you are developing your code.
+
+ii. Integration Testing
+Although each module is unit tested, we need another type of testing where software modules are integrated logically and tested as a group.
+
+For this, we use integration testing.
+With integration testing, we validate the interaction between the subsystems of our application.
+
+iii. End To End Testing
+It ensures that your application can run properly under real world scenarios.
+The goal of this testing is to closely simulate a user experience from start to finish.
+
+-------------------------------------------Section 8: Monitoring and Logging-------------------------------------------
+
+41. Managing Clusters----------------------------------------------------------
+
+In this lecture.
+
+We will see how to manage cluster permissions and monitor its performance.
+
+You can configure two types of cluster permissions.
+
+1. The first one is accessed from the admin console.
+
+Under users tab, you can control user ability to create clusters by enabling the allow unrestricted cluster creation permission.
+
+This user has currently no permission to create clusters.
+Let us grant her this permission by enabling this checkbox.
+Click confirm.
+Great.
+
+2. The second type is the cluster level permissions.
+
+Go to the Compute tab.
+
+From the clusters list here.
+
+Click the more menu and select Edit Permissions.
+
+Cluster level permissions control user ability to use and modify the cluster.
+
+There are three permission levels for databricks clusters: 
+i. Can Attach To, which give the ability to attach a notebook to the cluster and view the cluster metrics logs and spark UI.
+
+ii. Next, Can Restart permission level, which gives all the previous level abilities in addition to start,
+terminate and restart the cluster.
+
+iii. Lastly, the Can Manage permission level that gives full permission on the cluster.
+In addition to all the previous two levels abilities, you can edit the cluster and its permissions.
+
+And of course you can assign these permission levels to users or group of users.
+
+
+
+----------Cluster Logs-----------
+
+Databricks provides several options of logging cluster related activities.
+
+1. Event log-
+Event log shows important life cycle events that happened with the cluster.
+This includes both events that are triggered manually by user actions or automatically by Databricks.
+
+For example, when the cluster was created or terminated, if it is edited or if it is running fine.
+
+So this helps to track the activity of a cluster.
+
+You can filter the log by event type.
+
+As you can see, there are many types of cluster events.
+
+Another interesting event type is the resizing. 
+This allows you to review the timeline for a cluster auto scaling events, both scaling up and scaling down.
+
+2. Driver Logs
+
+Here, you get the logs generated within the cluster.
+So all the direct print and log statements from your notebooks, jobs and libraries go to the driver logs.
+
+These logs have three outputs.
+
+Standard output, Standard error and log4j logs.
+
+You will find the message here in the standard output.
+
+In addition, you can download the log file simply by clicking on the file name.
+
+3. Metrics Tab
+From here, you can monitor the performance of your cluster.
+
+For this, Databricks provide access to the Ganglia metrics.
+
+To access the Ganglia UI, click here on the Ganglia UI link.
+
+Ganglia UI provides you with overall cluster health.
+
+This helps you to understand what's going on on your cluster and it is performance.
+
+The first things to notice here is these four graphs that shows the usage of your cluster resources.
+
+The first graph shows the overall workload of your cluster in term of the number of processes and nodes currently running.
+
+Next we start breaking this down to get the overall memory usage.
+So you see how much RAM is being used for caching, processing and storing data across all the cluster nodes.
+
+Then the CPU usage where you may see spikes that indicate how busy your cluster.
+
+And lastly, the network usage.
+
+So these four graphs give an overview of the whole cluster.
+
+
+
+At the bottom here, you can see these statistics per each node of the cluster.
+In our cluster, we have currently three nodes: one driver and two executors.
+
+You can know which one is the driver node based on the IP address.
+So from here you can dive deep in understanding what's going on on each node
+even if the overall cluster health looks good.
+
+For start, choose the metrics you are interested in from this list.
+
+For example, you can look at the memory report.
+Essentially it is the same cluster memory graph.
+But broken down by executer.
+
+You can also look at the CPU report.
+Here you can explore, for example, if your driver is suffering from heavy CPU usage or you can see,
+for example, if all your worker nodes are experiencing high CPU utilization.
+This means that you may need to add more worker nodes or enabling auto-scaling on your cluster.
+
+Also from here, you can compare your cluster nodes to see if the amount of work they are doing is even or not.
+
+This could be useful, for example, to know if you have any skew in your data.
+In other words, one of your worker nodes has got a drastically higher usage than others.
+Great.
+
+Similarly, you can look at the disk report for understanding what's going on in term of disk.
+From here. You can tell, for example, if one of your executor is spitting out a lot of data to disk when it runs out of memory.
+
+Note: All these live metrics are available only when the cluster is running.
+When you turn off or restart your cluster, you lose the access to these metrics.
+
+However, Databricks takes some screenshots of these metrics for you.
+To view these screenshots, go back to the Metrics page of your cluster.
+Here you have access to the historical metrics of your cluster in a snapshot files.
+When you click on a snapshot file, you see that it's just a picture.
+
+-------------------------------------------Section 9:Data Sharing and Federation-------------------------------------------
+
+42. Delta Sharing----------------------------------------------------------
+
+In this lecture, we will talk about Delta sharing.
+
+You will understand what Delta sharing is and how it actually works. And you will also learn about its costs and limitations.
+
+IMP:
+Delta sharing is an open protocol for secure data sharing.
+It simplifies sharing live data with other organizations regardless of which computing platform they use.
+
+How Does Delta Sharing Works ?---------------------- 
+
+In Delta sharing, There are two parties involved.
+
+There is a data provider and a data recipient.
+
+The data provider can share Delta Lake tables via a Delta sharing server, which implements the
+server-side component of the protocol.
+In this server, you can decide which recipient have access to which subset of the data.
+
+Now, on the data recipient side, they can actually run any client that implements the Delta sharing protocol.
+These could be Apache Spark, Pandas, Power BI, or any system that supports this open protocol.
+
+How does this actually happen under the hood ?----------------------
+
+The data recipient who wants to query a source table such as the "orders" table.
+Start by sending a request to the Delta sharing server.
+
+The server checks the access permissions and see whether this access is allowed.
+
+If so, it checks the underlying table files in the cloud storage system like Amazon S3, and it generates
+temporary URLs for accessing those specific files.
+
+Then, it sends these URLs back to the client.
+The client now can open these Https links to actually transfer the relevant objects directly from the cloud object store.
+
+
+This means that with this protocol, you can share massive datasets as it directly leverages the cloud
+optimized infrastructure for data transfer.
+
+In Databricks, you have an integrated secure Delta sharing server, and you can set access permissions
+using Unity Catalog.
+
+
+So now in Databricks, you can just run few commands to create a Share object, which is a collection
+of data that you want to share.
+
+
+And then you can just grant permissions to recipients on the share using a standard grant statement.
+
+Note:
+On Databricks, there are two ways to share data using Delta sharing: 
+
+1. Databricks-to-Databricks(D2D) sharing
+Databricks-to-Databricks Sharing allows you to share data between Databricks clients who use Unity Catalog.
+
+This does not only support sharing tables, but also sharing views, volumes, and even notebooks.
+This sharing mechanism uses built-in authentication, which eliminates the need for token exchange between
+Databricks environments.
+
+With Databricks-to-Databricks Sharing, you can also share table history by specifying the WITH HISTORY clause.
+This allows recipients to perform time travel queries and read the table with Spark Structured Streaming.
+
+In addition, they can query the change data feed of the shared table.
+For this, you just need to ensure that CDF is enabled on the table before you sharing it WITH HISTORY.
+
+Sharing history works by giving access to the root directory of the shared table.
+This allows performance similar to directly accessing the source table.
+
+2. Databricks Open Sharing protocol(D2O).
+This lets you share data that you manage in Unity Catalog with users who don't use Databricks.
+
+This approach requires external authentication via bearer tokens or OpenID Connect Federation.
+
+
+Note:
+In order to be able to create and manage Delta shares in Unity Catalog, you need to be either a metastore
+admin or a user with a CREATE SHARE privilege on the metastore.
+
+
+COST 
+In terms of cost, Delta sharing does not require data replication, so there is no extra storage cost.
+
+However, you may be charged data transfer cost by your cloud provider when data transferred to other
+cloud regions or to other cloud providers.
+
+This cost is called egress fees.
+
+To avoid this cost, you may consider cloning the shared data to local regions or share the data from
+cheaper alternative services like Cloudflare R2, which has no egress fees.
+
+LIMITATION---------
+And in addition to egress costs when crossing boundaries, there are two other limitations of data sharing.
+
+i. A fundamental limitation is that all data shared via Delta sharing is read only for the recipients,
+so they don't have the ability to insert, update, or delete records in the shared tables.
+
+ii. In addition, these tables must be in Delta Lake format.
+
+
+---------------------------------------------------EXTRA Info
+🔷 What is Delta Sharing?
+
+Delta Sharing is an open protocol for securely sharing live data across organizations, platforms, and cloud environments.
+It lets you share a Delta table (or part of it) with external users or systems — without copying or moving the data.
+
+In simple words:
+
+🗣 “It’s like giving read access to a live table — instead of sending them a CSV or snapshot.”
+
+🧩 Example Scenario
+
+Suppose you are Company A (the data producer), and Company B (a partner or customer) needs daily updated sales data.
+
+Traditionally, you might:
+
+Export data to CSV/Parquet files
+
+Upload to S3 or send over FTP
+
+They download it manually
+
+❌ Problems:
+
+Stale data
+
+Security risk
+
+Storage duplication
+
+✅ With Delta Sharing, you simply grant them access to your Delta table:
+
+They can query it directly in their Databricks, Power BI, pandas, or even Snowflake.
+
+They see live, up-to-date data.
+
+No duplication.
+
+🧱 Key Components of Delta Sharing
+Component	Description
+Provider	The data owner — creates and shares data.
+Recipient	The data consumer — receives and reads shared data.
+Share	Logical container that holds tables or views being shared.
+Recipient Token	A secure access token the recipient uses to connect.
+Sharing Server (Delta Share Server)	A REST API that allows recipients to access shared data securely.
+🗂️ Hierarchy in Databricks Delta Sharing
+
+Think of it like a hierarchy:
+
+Provider (You)
+ └── Share (e.g., "Sales_Share")
+      ├── Schema (e.g., "finance")
+      │    ├── Table1 (sales_orders)
+      │    ├── Table2 (sales_customers)
+      │    └── View1  (top_products)
+ └── Recipient (partner_abc)
+      └── Access granted via token or Databricks recipient connection
+
+⚙️ Steps for Sharing in Databricks
+🔹 Step 1: Create a Share
+CREATE SHARE sales_share;
+
+🔹 Step 2: Add Tables to Share
+ALTER SHARE sales_share ADD TABLE my_catalog.sales_db.orders;
+
+🔹 Step 3: Create Recipient
+CREATE RECIPIENT partner_abc USING IDENTITY 'email@partner.com';
+
+🔹 Step 4: Grant Access
+GRANT SELECT ON SHARE sales_share TO RECIPIENT partner_abc;
+
+
+The recipient then receives a sharing link or token.
+
+👤 Recipient Side
+
+Recipients can connect in multiple ways:
+
+🔸 Option 1: Using Databricks
+CREATE CATALOG shared_data
+USING SHARE 'provider_name.sales_share';
+
+
+Then simply:
+
+SELECT * FROM shared_data.sales_db.orders;
+
+🔸 Option 2: Using External Clients
+
+They can use:
+
+Python (with delta-sharing library)
+
+Power BI
+
+Tableau
+
+Pandas
+
+Apache Spark
+
+Example in Python:
+
+from delta_sharing import DeltaSharingProfile, load_as_pandas
+
+profile = DeltaSharingProfile.from_file("profile.share")
+df = load_as_pandas(profile, "share_name.schema.table_name")
+print(df.head())
+
+🧠 How It Works (Behind the Scenes)
+
+Provider registers a Delta Share Server.
+
+Provider publishes metadata of shared tables.
+
+Recipient connects via REST API using token or profile.
+
+Delta Share Server authorizes and provides pre-signed URLs to access actual Parquet files.
+
+Data is read securely — no copy, no duplication.
+
+✅ Advantages
+Benefit	Explanation
+Open Protocol	Not locked to Databricks; works with open-source clients.
+No Data Copying	Shared live data without replication.
+Secure	Fine-grained permissions + short-lived tokens.
+Real-time	Recipients always get the latest version.
+Cross-Cloud	Share data between AWS, Azure, GCP seamlessly.
+⚠️ Limitations & Considerations
+Limitation	Explanation
+Read-only	Recipients can query but cannot modify data.
+Latency	Data refresh isn’t “real-time streaming,” but near-real-time.
+Access Control	Granular, but provider must manage carefully.
+Schema Changes	Provider must handle schema evolution thoughtfully.
+📦 Use Cases
+
+✅ Sharing data with external partners or clients
+
+✅ Publishing data to business units or vendors
+
+✅ Creating data marketplaces
+
+✅ Sharing data between different Databricks workspaces or accounts
+
+✅ Integrating with BI tools without exporting files
+
+🔐 Security
+
+Delta Sharing supports:
+
+Fine-grained access control
+
+Token expiration
+
+Row- and column-level security (via Unity Catalog dynamic views)
+
+Auditing via Unity Catalog logs
+
+🧾 Summary Table
+Term	Role	Example
+Share	Container holding shared tables	sales_share
+Provider	Creates and publishes data	CompanyA
+Recipient	Reads shared data	CompanyB
+Profile File	Connection info for recipients	profile.share
+Server	REST API serving Delta Share data	Delta Sharing Server
+🚀 Summary in One Line
+
+🔁 Delta Sharing = “Secure, live, read-only data sharing across clouds or organizations — without copying or exporting files.”
+
+-------------------------------------------------EXTRA INFO Ended
+
+43. Lakehouse Federation-------------------------------------------------------------
+
+In this lecture, we will talk about Lakehouse Federation.
+
+You will understand the challenges associated with data ingestion and how Lakehouse Federation helps to address them.
+
+We know that Ingestion copies data from the source systems into Databricks.
+
+This is the recommended approach for most use cases because it scales to accommodate high data volumes, low latency querying, and third party API limits.
+
+However, this approach results in duplicate data that might become outdated over time.
+So if you don't want to copy data, you can use solutions like Delta Sharing to receive live data from the source.
+
+However, this is limited to Delta Lake format.
+Instead, we can use Lakehouse Federation.
+
+
+Lakehouse Federation-----------------------------------
+Lakehouse Federation allows you to directly query multiple external sources without data migrations.
+
+You start by establishing a connection to an external source, like a MySQL database.
+
+Then you create a foreign catalog in Unity Catalog to register the definition of this external database and its tables.
+
+Now, when you query these tables, the queries are pushed down to the external system to be executed
+and retrieve the results in real time.
+
+So this is a great solution if you want to maintain live access to external systems, or just for
+ad hoc reporting or proof of concepts that need access to operational data stored in external databases.
+
+
+Note:-
+However, for large or complex queries, you will not benefit from the power of Databricks.
+Remember, queries are pushed down to be execute on the remote compute resources within the external source system.
+
+So heavy duty queries will not leverage the distributed processing and optimize resource utilization
+on Databricks. 
+
+For advanced use cases, Consider using materialized views on foreign tables or ingesting the data into the lakehouse.
+
+
+-------------------------------------------------EXTRA INFO
+
+🔷 1️⃣ Context — Why Lakehouse Federation Exists
+
+When companies have data spread across many systems —
+
+Cloud warehouses (like BigQuery, Snowflake, Redshift)
+
+Databases (like SQL Server, Oracle, MySQL)
+
+Cloud storage (S3, ADLS, GCS)
+they often want a single place to query everything without moving or copying data.
+
+➡️ This is what Lakehouse Federation solves inside Databricks Unity Catalog.
+
+🔷 2️⃣ Definition
+
+Lakehouse Federation = The capability in Databricks Unity Catalog that allows you to query and govern data stored outside your Databricks-managed storage as if it were inside your Databricks Lakehouse.
+
+It creates federated connections to external data sources so that you can:
+
+Run SQL queries directly on external systems (no ETL needed)
+
+Apply Unity Catalog governance (permissions, auditing, lineage)
+
+Combine external tables with Delta tables in one query
+
+🔷 3️⃣ Architecture Overview
++--------------------------------------------------------------+
+|                       Unity Catalog                          |
+|     (Centralized Governance, Permissions, Lineage, etc.)     |
++---------------------------+----------------------------------+
+                            |
+                            |
+          +-----------------v-------------------+
+          |         Lakehouse Federation        |
+          | (Federated Queries and Connections) |
+          +-----------------+-------------------+
+                            |
+    +------------------------+--------------------------+
+    |                        |                          |
++---v----+             +-----v----+              +------v------+
+| SQL    |             | Snowflake |             | BigQuery    |
+| Server |             | (external)|             | (external)  |
++--------+             +-----------+             +-------------+
+
+🔷 4️⃣ Key Concepts
+Concept	Description
+Foreign Catalog	Logical catalog inside Unity Catalog that represents an external data source (e.g., Snowflake, MySQL, SQL Server).
+Connection	Defines how Databricks connects to the external system (driver, host, credentials, etc.).
+External Table	Tables in external systems that appear in Databricks SQL Explorer or Data Explorer under the foreign catalog.
+Federated Query	Query combining data from external sources + Delta tables in one SQL statement.
+🔷 5️⃣ Example Setup
+
+Let’s say you have:
+
+Azure SQL Database with schema Sales
+
+Databricks Unity Catalog with your workspace catalog main
+
+You can create a connection and foreign catalog like this (SQL):
+
+-- 1. Create a connection to Azure SQL Database
+CREATE CONNECTION azure_sql_conn
+USING sqlserver
+OPTIONS (
+  host 'myserver.database.windows.net',
+  port '1433',
+  user 'sql_user',
+  password 'my_secret_password'
+);
+
+-- 2. Create a foreign catalog mapped to that connection
+CREATE FOREIGN CATALOG azure_sales
+USING CONNECTION azure_sql_conn;
+
+
+Now, in Data Explorer, you’ll see:
+
+main
+├── my_lakehouse_data (Delta)
+└── azure_sales        (Foreign Catalog to SQL Server)
+
+🔷 6️⃣ Federated Query Example
+SELECT 
+  l.customer_id,
+  l.total_spent,
+  s.city
+FROM main.my_lakehouse_data.customer_lifetime l
+JOIN azure_sales.sales.customers s
+  ON l.customer_id = s.customer_id
+WHERE s.city = 'Mumbai';
+
+
+➡️ This query joins a Delta table (in Databricks) with a table from SQL Server without copying the SQL Server data into Databricks.
+
+🔷 7️⃣ Supported Sources (as of 2025)
+Data Source	Supported?
+Amazon Redshift	✅
+Azure SQL Database	✅
+PostgreSQL	✅
+Snowflake	✅
+Google BigQuery	✅
+MySQL	✅
+Oracle	✅ (Preview)
+Databricks to Databricks (cross-workspace)	✅
+🔷 8️⃣ Benefits
+
+✅ No ETL or replication — query live data
+✅ Centralized governance through Unity Catalog
+✅ Combine data across clouds and systems
+✅ Lineage + audit support
+✅ Role-based access controls (RBAC) still apply
+
+🔷 9️⃣ Limitations / Notes
+
+🚫 Performance depends on the external source (data pulled remotely)
+🚫 Not ideal for heavy analytics — best for lookup or light joins
+🚫 Some SQL features may vary across connectors
+🚫 Caching may be needed for repeated queries (use MATERIALIZED VIEW)
+
+🔷 10️⃣ Summary
+Feature	Description
+Purpose	Query external systems from Databricks using Unity Catalog
+Governance	Full Unity Catalog controls apply
+Setup	Create Connection → Create Foreign Catalog
+Use Case	Federated analytics, cross-source reporting, unified governance
+Alternative	If data needs heavy processing → ingest into Delta tables instead
+
+
+🔷 1️⃣ Where the Connection is Stored
+
+When you create a connection like this:
+
+CREATE CONNECTION azure_sql_conn
+USING sqlserver
+OPTIONS (
+  host 'myserver.database.windows.net',
+  port '1433',
+  user 'sql_user',
+  password 'my_secret_password'
+);
+
+
+Databricks does not store it in your workspace or notebook.
+Instead, it is stored securely in Unity Catalog’s metastore — specifically, in the Unity Catalog connection object registry.
+
+📍 Storage Location:
+
+The connection metadata (like connection name, driver type, host, port) is stored inside Unity Catalog.
+
+The credentials (like passwords, access tokens, secrets) are encrypted and stored securely using Databricks’ secret management system, not in plaintext in Unity Catalog.
+
+🔷 2️⃣ How Connection Security Works
+🧩 A connection in Unity Catalog consists of:
+Part	Description	Storage
+Connection Metadata	Includes connection name, type (sqlserver, snowflake, etc.), and host info.	Unity Catalog metastore (encrypted at rest).
+Credentials	Username/password, token, key, etc.	Stored encrypted, often linked to a secret scope or secret reference.
+Ownership & ACLs	Who can read, update, or use the connection.	Managed by Unity Catalog Access Control Lists (ACLs).
+🔷 3️⃣ Credentials Storage and Encryption
+✅ Options:
+
+Inline Credentials
+
+You can specify user/password in the CREATE CONNECTION command.
+
+These are encrypted using Databricks’ KMS (Key Management Service) keys before being persisted.
+
+Secret References (Recommended)
+
+You store credentials in Databricks Secrets or Azure Key Vault / AWS Secrets Manager / GCP Secret Manager.
+
+Then you reference them securely:
+
+CREATE CONNECTION azure_sql_conn
+USING sqlserver
+OPTIONS (
+  host 'myserver.database.windows.net',
+  port '1433',
+  user secret('my_scope', 'sql_user'),
+  password secret('my_scope', 'sql_password')
+);
+
+
+Unity Catalog fetches credentials only when executing a query, not during catalog creation.
+
+📌 Secrets are never logged or displayed in the UI, audit logs, or query history.
+
+🔷 4️⃣ Access Control (Who Can Use the Connection)
+
+Unity Catalog enforces RBAC (Role-Based Access Control) on connections:
+
+Permission	Description
+USE CONNECTION	Allows running queries using the connection (e.g., foreign catalog access).
+CREATE FOREIGN CATALOG	Allows creating a foreign catalog that uses the connection.
+OWN	Full control — modify or drop the connection.
+
+Example:
+
+GRANT USE CONNECTION ON CONNECTION azure_sql_conn TO `data_analyst_group`;
+
+
+➡️ Only members of data_analyst_group can use that connection to query external data.
+
+🔷 5️⃣ Runtime Security
+
+When you run a federated query:
+
+SELECT * FROM azure_sql_conn.sales.customers;
+
+
+Databricks SQL execution engine:
+
+Retrieves the connection definition from Unity Catalog.
+
+Decrypts credentials in memory (never written to disk).
+
+Establishes a temporary connection to the external source.
+
+Executes the query using a Databricks-managed compute.
+
+Drops the connection after use.
+
+All of this happens within Databricks’ managed runtime, not your local machine.
+
+🔷 6️⃣ Network and Data Security
+
+All connections use TLS/SSL encryption in transit.
+
+For Azure, AWS, and GCP, Databricks supports Private Link / VPC Peering to keep traffic inside your cloud network.
+
+No external data movement happens outside unless explicitly queried.
+
+Audit logs track who accessed what and when (via Unity Catalog audit).
+
+🔷 7️⃣ Audit & Compliance
+
+Unity Catalog provides auditing for every action:
+
+Who created/modified/dropped a connection
+
+Who queried a foreign catalog
+
+When credentials were accessed
+
+Audits are stored in your account-level audit logs for compliance (GDPR, SOC 2, HIPAA, etc.).
+
+🔷 8️⃣ Summary
+Aspect	Description
+Storage	In Unity Catalog metastore
+Credentials	Encrypted (Databricks-managed or external secrets)
+Access Control	Managed via Unity Catalog permissions
+Encryption	At rest (AES-256) and in transit (TLS)
+Auditability	Full audit logs via Unity Catalog
+Security Best Practice	Use secret references instead of inline credentials
+
